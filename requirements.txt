@@ -1,0 +1,28 @@
+# Core scientific Python
+numpy
+scipy
+pandas
+
+# Deep learning
+torch
+
+# Structure prediction (optional, for local scoring)
+biopython
+
+# RL and MCTS
+ray[rllib]
+anytree
+
+# Progress and logging
+rich
+tqdm
+
+# For running shell commands (structure prediction wrappers)
+subprocess32; python_version<'3.5'
+
+# Jupyter (optional)
+jupyter
+
+# Visualization
+matplotlib
+seaborn 
