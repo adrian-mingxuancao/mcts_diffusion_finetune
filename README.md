@@ -1,47 +1,151 @@
-# MCTS/Imitation Learning Framework for Protein Language Models
+# MCTS-Guided Diffusion Finetuning for Inverse Folding
+
+This repository implements Monte Carlo Tree Search (MCTS) guided finetuning for inverse folding using diffusion-based protein language models (DPLM-2).
 
 ## Overview
-This project implements a general, modular framework for finetuning protein language models (PLMs)—mainly for diffusion-based models—using expert rollouts (e.g., Monte Carlo Tree Search, MCTS) and imitation learning. The goal is to improve performance on a variety of downstream protein tasks, such as inverse folding, representation learning, structure prediction, and more. Inverse folding is used as an initial testbed, but the framework is designed to be extensible to new tasks, models, and reward functions.
 
-## Motivation & Novelty
-- **Why Diffusion Models?** Protein sequences and structures are long and complex. Autoregressive transformer models struggle with long-range dependencies and slow, sequential generation. Diffusion models, by contrast, enable simultaneous generation and masking, making them more scalable and efficient for large proteins and long sequences. This property is leveraged for more effective tree search and expert rollouts.
-- **Key Novelty:** This framework is among the first to combine Monte Carlo Tree Search (MCTS) with diffusion-based protein language models for downstream protein tasks. The simultaneous, non-autoregressive nature of diffusion models enables more efficient and flexible tree building and exploration compared to traditional autoregressive approaches.
+The project implements two different MCTS approaches for inverse folding:
 
-## Key Features
-- **Task-agnostic core:** Modular design to support multiple downstream tasks.
-- **Expert/Imitation Learning:** Use MCTS or other expert/planning methods to generate high-quality rollouts for imitation learning or RL.
-- **Flexible Reward Functions:** Easily define new reward/value functions for different tasks (e.g., TM-score, plDDT, representation similarity).
-- **Model Agnostic:** Supports both diffusion-based and other PLMs.
-- **Extensible Evaluation:** Plug in new tasks, reward functions, and evaluation metrics with minimal code changes.
+1. **Sequence-Level MCTS** (`sequence_level_mcts.py`): Each node represents a complete candidate sequence
+2. **Position-Level MCTS** (`position_level_mcts.py`): Each node represents a partial sequence with masked positions, using plDDT scores to guide unmasking
 
-## Framework Structure
-1. **Core Framework**: Modular, extensible codebase for expert-guided finetuning of PLMs.
-2. **Task Modules**: Pluggable modules for different downstream tasks (e.g., inverse folding, representation learning, structure prediction).
-3. **Expert/Planning Module**: MCTS or other tree search/expert rollout logic, supporting flexible action/state spaces.
-4. **Reward/Value Module**: Task-specific reward functions, supporting both partial and full rollouts.
-5. **Learning/Finetuning Module**: Imitation learning (behavior cloning) and RL (policy/value updates).
-6. **Evaluation Module**: Task-specific metrics and benchmarking.
+## Key Components
 
-## Example Use Case
-- **Inverse folding** (structure → sequence) as the first implemented task.
+### Core MCTS Implementations
 
-## Pipeline (with plDDT-based Masking)
-1. Input: Target protein structure
-2. Predict initial sequence using diffusion model
-3. Scan sequence for positions with lowest plDDT (confidence)
-4. Mask low-confidence positions (practical, not novel)
-5. Use MCTS to sample candidate amino acids for masked positions, leveraging diffusion's simultaneous update capability
-6. Predict structure and compute reward (e.g., TM-score, plDDT)
-7. Backpropagate rewards and update model via imitation learning or RL
+- `sequence_level_mcts.py` - Sequence-level MCTS where each node is a complete sequence
+- `position_level_mcts.py` - Position-level MCTS with plDDT masking guidance
+- `compare_mcts_approaches.py` - Comparison script to evaluate both approaches
+
+### Supporting Modules
+
+- `protein_utils.py` - Protein structure utilities and metrics computation
+- `dplm_inverse_folding.py` - DPLM-2 model integration for inverse folding
+- `prototype_invfold_finetune.py` - Main prototype pipeline
+- `test_initial_rewards.py` - Testing initial reward distributions
+
+### Legacy Files (Kept for Reference)
+
+- `mcts_search.py` - Original MCTS implementation (superseded by new approaches)
+
+## Installation
+
+```bash
+# Create conda environment
+conda create -n mcts_dplm python=3.9
+conda activate mcts_dplm
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+## Usage
+
+### Running Sequence-Level MCTS
+
+```python
+from sequence_level_mcts import SequenceLevelMCTS
+from protein_utils import create_mock_structure_no_sequence
+
+# Create test structure
+structure = create_mock_structure_no_sequence(length=50)
+
+# Initialize MCTS
+mcts = SequenceLevelMCTS(
+    model=model,
+    tokenizer=tokenizer,
+    max_depth=5,
+    num_simulations=50,
+    exploration_constant=1.414,
+    temperature=1.0
+)
+
+# Run search
+best_sequence, best_reward = mcts.search(structure, target_length=50)
+```
+
+### Running Position-Level MCTS
+
+```python
+from position_level_mcts import PositionLevelMCTS
+
+# Initialize MCTS with plDDT masking
+mcts = PositionLevelMCTS(
+    model=model,
+    tokenizer=tokenizer,
+    max_depth=10,
+    num_simulations=100,
+    exploration_constant=1.414,
+    temperature=1.0,
+    plddt_threshold=0.7,
+    max_unmask_per_step=3
+)
+
+# Run search
+best_sequence, best_reward = mcts.search(structure, target_length=50)
+```
+
+### Comparing Both Approaches
+
+```python
+from compare_mcts_approaches import MCTSComparison
+
+# Run comparison
+comparison = MCTSComparison()
+result = comparison.run_comparison(target_length=50)
+```
+
+## Key Differences Between Approaches
+
+### Sequence-Level MCTS
+- **Node representation**: Complete sequences
+- **Search strategy**: Generate full sequences and explore variations
+- **Advantages**: Simpler implementation, good for global optimization
+- **Use case**: When you want to explore complete sequence space
+
+### Position-Level MCTS
+- **Node representation**: Partial sequences with masked positions
+- **Search strategy**: Unmask positions based on plDDT confidence scores
+- **Advantages**: More interpretable, leverages structural confidence
+- **Use case**: When you want fine-grained control over sequence generation
+
+## Architecture
+
+```
+MCTS-Guided Inverse Folding Pipeline
+├── Structure Input (PDB/mmCIF)
+├── MCTS Search
+│   ├── Selection (UCB1)
+│   ├── Expansion (Generate candidates)
+│   ├── Simulation (Evaluate sequences)
+│   └── Backpropagation (Update statistics)
+├── Reward Computation
+│   ├── Structure-sequence compatibility
+│   ├── Biophysical properties
+│   └── Sequence diversity
+└── Model Update (Imitation Learning)
+```
+
+## Reward Function
+
+The reward function combines multiple factors:
+- Structure-sequence compatibility (placeholder for TM-score)
+- Hydrophobicity balance
+- Charge neutrality
+- Sequence diversity
+- Length constraints
+
+## Future Work
+
+- [ ] Integrate actual DPLM-2 model for sequence generation
+- [ ] Implement proper plDDT computation
+- [ ] Add TM-score and other structure metrics
+- [ ] Implement model finetuning with imitation learning
+- [ ] Add support for real protein structures
+- [ ] Optimize hyperparameters for different protein types
 
 ## References
-- [ProtInvTree: Reward-guided Tree Search for Protein Inverse Folding](https://arxiv.org/pdf/2506.00925)
 
-## TODO
-- [ ] Scaffold modular codebase
-- [ ] Implement core expert/planning module (MCTS)
-- [ ] Add task modules (start with inverse folding)
-- [ ] Integrate reward/value functions
-- [ ] Add learning/finetuning logic (imitation learning, RL)
-- [ ] Add evaluation/benchmarking tools
-- [ ] Document extensibility for new tasks and models 
+- arXiv:2506.00925 - MCTS-guided protein design
+- arXiv:2406.07025 - Entropy-guided drug design
+- DPLM-2: Diffusion-based protein language model 
