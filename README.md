@@ -2,33 +2,137 @@
 
 This repository implements Monte Carlo Tree Search (MCTS) guided finetuning for inverse folding using diffusion-based protein language models (DPLM-2).
 
-## Overview
+## 📁 Project Structure
 
-The project implements two different MCTS approaches for inverse folding:
+```
+mcts_diffusion_finetune/
+├── core/                           # Core MCTS algorithms and model integration
+│   ├── __init__.py                 # Core module exports
+│   ├── sequence_level_mcts.py      # Main sequence-level MCTS implementation
+│   └── dplm2_integration.py        # DPLM-2 model integration
+├── utils/                          # Utility functions and helpers
+│   ├── __init__.py                 # Utils module exports
+│   ├── protein_utils.py            # Protein structure manipulation
+│   ├── plddt_computation.py        # plDDT scoring functions
+│   └── reward_computation.py       # Enhanced length-aware reward system
+├── examples/                       # Example scripts and demonstrations
+│   ├── demo_mcts_simulations.py    # Clear demonstration script
+│   └── detailed_simulations.py     # Comprehensive simulation analysis
+├── tests/                          # Unit tests (for future development)
+├── docs/                           # Documentation (for future development)
+├── requirements.txt                # Python dependencies
+└── README.md                       # This file
+```
 
-1. **Sequence-Level MCTS** (`sequence_level_mcts.py`): Each node represents a complete candidate sequence
-2. **Position-Level MCTS** (`position_level_mcts.py`): Each node represents a partial sequence with masked positions, using plDDT scores to guide unmasking
+## 🎯 Focus on Sequence-Level MCTS
 
-## Key Components
+The codebase emphasizes **sequence-level MCTS** as the primary approach for inverse folding:
 
-### Core MCTS Implementations
+- **Each node represents a complete protein sequence**
+- **Tree structure**: Root → DPLM-2 initial sequences → Point mutations/variations
+- **Search process**: Selection → Expansion → Simulation → Backpropagation
+- **Optimized for different protein lengths** (50, 200, 500 residues)
 
-- `sequence_level_mcts.py` - Sequence-level MCTS where each node is a complete sequence
-- `position_level_mcts.py` - Position-level MCTS with plDDT masking guidance
-- `compare_mcts_approaches.py` - Comparison script to evaluate both approaches
+## 🧬 MCTS Node Structure and Organization
 
-### Supporting Modules
+### Node Representation
+```python
+@dataclass
+class MCTSNode:
+    sequence: str           # Complete amino acid sequence
+    reward: float          # Computed reward score
+    visit_count: int       # Number of visits
+    total_value: float     # Cumulative reward
+    children: List[MCTSNode]  # Child nodes (sequence variations)
+```
 
-- `protein_utils.py` - Protein structure utilities and metrics computation
-- `dplm_inverse_folding.py` - DPLM-2 model integration for inverse folding
-- `prototype_invfold_finetune.py` - Main prototype pipeline
-- `test_initial_rewards.py` - Testing initial reward distributions
+### Actual Tree Structure (Based on Implementation)
 
-### Legacy Files (Kept for Reference)
+```
+Root Node (empty sequence "")
+├── Child 1 (DPLM-2 generated sequence A)
+│   ├── Grandchild 1.1 (Point mutation of A: pos 5 A→V)
+│   ├── Grandchild 1.2 (Point mutation of A: pos 12 L→F)
+│   └── Grandchild 1.3 (Point mutation of A: pos 23 K→R)
+├── Child 2 (DPLM-2 generated sequence B)
+│   ├── Grandchild 2.1 (Point mutation of B: pos 8 D→E)
+│   └── Grandchild 2.2 (Point mutation of B: pos 15 G→A)
+└── Child 3 (DPLM-2 generated sequence C)
+    ├── Grandchild 3.1 (Point mutation of C: pos 3 M→I)
+    └── ...
+```
 
-- `mcts_search.py` - Original MCTS implementation (superseded by new approaches)
+**Key Process:**
+1. **Root**: Empty sequence (starting point)
+2. **Level 1**: DPLM-2 generates initial complete sequences
+3. **Level 2+**: Point mutations of existing sequences (1-3 amino acid changes)
 
-## Installation
+## 🔄 MCTS Simulation Process
+
+### 1. **Initialization**
+- Create root node with empty sequence
+- Use DPLM-2 to generate initial complete sequences
+- Add these as children of root node
+
+### 2. **Selection Phase**
+- Start from root node
+- Use **Upper Confidence Bound (UCB1)** to select child nodes
+- UCB1 formula: `value + c * sqrt(ln(parent_visits) / node_visits)`
+- Traverse down the tree until reaching a leaf node
+
+### 3. **Expansion Phase**
+- Generate sequence variations from selected node
+- **Point mutations**: Randomly mutate 1-3 amino acid positions
+- **Fallback**: Random sequences if node is empty
+- Create new child nodes for each unique sequence
+
+### 4. **Simulation Phase**
+- Evaluate the selected node using the reward function
+- Reward components:
+  - Structure-sequence compatibility
+  - Biophysical properties (hydrophobicity, charge)
+  - Sequence diversity
+  - Length constraints
+
+### 5. **Backpropagation Phase**
+- Update statistics for the selected node
+- Increment visit counts and update cumulative values
+- Recalculate average values for future selections
+
+## 🏆 Enhanced Reward System
+
+### Length-Aware Reward Components
+
+#### Small Proteins (<100 residues)
+- **Structure compatibility**: 30%
+- **Hydrophobicity balance**: 30%
+- **Charge balance**: 25%
+- **Sequence diversity**: 10%
+- **Stability score**: 5%
+
+#### Medium Proteins (100-300 residues)
+- **Structure compatibility**: 40%
+- **Hydrophobicity balance**: 25%
+- **Charge balance**: 20%
+- **Sequence diversity**: 10%
+- **Stability score**: 5%
+
+#### Large Proteins (>300 residues)
+- **Structure compatibility**: 50%
+- **Hydrophobicity balance**: 20%
+- **Charge balance**: 15%
+- **Sequence diversity**: 10%
+- **Stability score**: 5%
+
+### Reward Calculation Details
+
+1. **Structure Compatibility**: Mock compatibility based on sequence properties (placeholder for TM-score)
+2. **Hydrophobicity Balance**: Optimal hydrophobic/hydrophilic ratio with length scaling
+3. **Charge Balance**: Neutrality with length-specific tolerance
+4. **Sequence Diversity**: Shannon entropy + natural amino acid distribution
+5. **Stability Score**: Avoids problematic patterns, promotes balanced secondary structure
+
+## 🚀 Installation
 
 ```bash
 # Create conda environment
@@ -39,113 +143,110 @@ conda activate mcts_dplm
 pip install -r requirements.txt
 ```
 
-## Usage
+## 📖 Usage
 
-### Running Sequence-Level MCTS
+### Basic Sequence-Level MCTS
 
 ```python
-from sequence_level_mcts import SequenceLevelMCTS
-from protein_utils import create_mock_structure_no_sequence
+from core import SequenceLevelMCTS
+from utils import create_mock_structure_no_sequence
 
-# Create test structure
-structure = create_mock_structure_no_sequence(length=50)
+# Create test structure (no sequence)
+structure = create_mock_structure_no_sequence(length=200)
 
 # Initialize MCTS
 mcts = SequenceLevelMCTS(
     model=model,
     tokenizer=tokenizer,
-    max_depth=5,
-    num_simulations=50,
-    exploration_constant=1.414,
-    temperature=1.0
-)
-
-# Run search
-best_sequence, best_reward = mcts.search(structure, target_length=50)
-```
-
-### Running Position-Level MCTS
-
-```python
-from position_level_mcts import PositionLevelMCTS
-
-# Initialize MCTS with plDDT masking
-mcts = PositionLevelMCTS(
-    model=model,
-    tokenizer=tokenizer,
-    max_depth=10,
+    max_depth=6,
     num_simulations=100,
-    exploration_constant=1.414,
-    temperature=1.0,
-    plddt_threshold=0.7,
-    max_unmask_per_step=3
+    exploration_constant=1.414
 )
 
 # Run search
-best_sequence, best_reward = mcts.search(structure, target_length=50)
+best_sequence, best_reward = mcts.search(structure, target_length=200)
 ```
 
-### Comparing Both Approaches
+### Running Demonstrations
 
 ```python
-from compare_mcts_approaches import MCTSComparison
+# Run educational demonstration
+python examples/demo_mcts_simulations.py
 
-# Run comparison
-comparison = MCTSComparison()
-result = comparison.run_comparison(target_length=50)
+# Run comprehensive analysis
+python examples/detailed_simulations.py
 ```
 
-## Key Differences Between Approaches
+## 🧪 Simulation Examples
 
-### Sequence-Level MCTS
-- **Node representation**: Complete sequences
-- **Search strategy**: Generate full sequences and explore variations
-- **Advantages**: Simpler implementation, good for global optimization
-- **Use case**: When you want to explore complete sequence space
+### Demo Script (`examples/demo_mcts_simulations.py`)
+- **Purpose**: Clear, educational demonstration
+- **Features**: 
+  - Node structure explanation
+  - Step-by-step simulation process
+  - Protein length comparison (50, 200, 500)
+  - Reward calculation explanation
 
-### Position-Level MCTS
-- **Node representation**: Partial sequences with masked positions
-- **Search strategy**: Unmask positions based on plDDT confidence scores
-- **Advantages**: More interpretable, leverages structural confidence
-- **Use case**: When you want fine-grained control over sequence generation
+### Detailed Simulations (`examples/detailed_simulations.py`)
+- **Purpose**: Comprehensive analysis for research
+- **Features**:
+  - Convergence tracking
+  - Diversity analysis
+  - Performance metrics
+  - Visualization plots
+  - JSON result export
 
-## Architecture
+### Key Simulation Parameters
 
-```
-MCTS-Guided Inverse Folding Pipeline
-├── Structure Input (PDB/mmCIF)
-├── MCTS Search
-│   ├── Selection (UCB1)
-│   ├── Expansion (Generate candidates)
-│   ├── Simulation (Evaluate sequences)
-│   └── Backpropagation (Update statistics)
-├── Reward Computation
-│   ├── Structure-sequence compatibility
-│   ├── Biophysical properties
-│   └── Sequence diversity
-└── Model Update (Imitation Learning)
-```
+| Length | Simulations | Max Depth | Exploration | Focus |
+|--------|-------------|-----------|-------------|-------|
+| 50     | 30-100      | 4         | 1.8         | Local optimization |
+| 200    | 50-150      | 6         | 1.414       | Balanced approach |
+| 500    | 80-200      | 8         | 1.0         | Global structure |
 
-## Reward Function
+## 📊 Key Insights
 
-The reward function combines multiple factors:
-- Structure-sequence compatibility (placeholder for TM-score)
-- Hydrophobicity balance
-- Charge neutrality
-- Sequence diversity
-- Length constraints
+### Performance Characteristics
+- **Small proteins**: Fast convergence (30-100 simulations), local optimization
+- **Medium proteins**: Balanced performance (50-150 simulations), good exploration
+- **Large proteins**: Thorough search (80-200 simulations), global structure focus
 
-## Future Work
+### MCTS Advantages
+- **Adaptive exploration**: UCB1 balances exploration vs exploitation
+- **Length-aware optimization**: Reward function adapts to protein size
+- **Interpretable process**: Clear node structure and selection criteria
+- **Scalable**: Can handle proteins from 50 to 500+ residues
 
-- [ ] Integrate actual DPLM-2 model for sequence generation
-- [ ] Implement proper plDDT computation
-- [ ] Add TM-score and other structure metrics
-- [ ] Implement model finetuning with imitation learning
-- [ ] Add support for real protein structures
-- [ ] Optimize hyperparameters for different protein types
+## 🔧 Technical Implementation
 
-## References
+### Core Classes
+- `SequenceLevelMCTS`: Main MCTS algorithm
+- `MCTSNode`: Tree node representation
+- `LengthAwareRewardComputation`: Sophisticated reward system
+
+### Key Methods
+- `search()`: Main MCTS search loop
+- `_select()`: UCB1-based node selection
+- `_expand()`: Sequence variation generation
+- `_simulate()`: Reward computation
+- `_backpropagate()`: Statistics update
+
+## 🔬 Future Enhancements
+
+- [ ] Integration with real DPLM-2 model
+- [ ] Proper plDDT computation from structure
+- [ ] TM-score and GDT-TS integration
+- [ ] Model finetuning with imitation learning
+- [ ] Support for real protein structures (PDB/mmCIF)
+- [ ] Parallel MCTS implementation
+- [ ] Advanced reward functions with learned components
+
+## 📚 References
 
 - arXiv:2506.00925 - MCTS-guided protein design
 - arXiv:2406.07025 - Entropy-guided drug design
-- DPLM-2: Diffusion-based protein language model 
+- DPLM-2: Diffusion-based protein language model
+
+## 🤝 Contributing
+
+This is a research prototype. For questions or contributions, please refer to the examples and test scripts for usage patterns. 

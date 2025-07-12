@@ -40,7 +40,14 @@ class MCTSNode:
         
         # UCB1 formula: value + exploration_constant * sqrt(ln(parent_visits) / visits)
         parent_visits = sum(child.visit_count for child in self.children) if self.children else 1
-        return self.average_value + exploration_constant * math.sqrt(math.log(parent_visits) / self.visit_count)
+        if parent_visits <= 0:
+            return self.average_value
+        
+        log_term = math.log(parent_visits)
+        if log_term <= 0:
+            return self.average_value
+            
+        return self.average_value + exploration_constant * math.sqrt(log_term / self.visit_count)
 
 
 class SequenceLevelMCTS:
@@ -210,7 +217,7 @@ class SequenceLevelMCTS:
     
     def _compute_reward(self, sequence: str, structure: Dict) -> float:
         """Compute reward for a sequence given the structure."""
-        from protein_utils import compute_structure_metrics
+        from utils.protein_utils import compute_structure_metrics
         
         if not sequence:
             return 0.0
@@ -241,7 +248,7 @@ class SequenceLevelMCTS:
 
 def run_sequence_level_mcts_example():
     """Example usage of sequence-level MCTS."""
-    from protein_utils import create_mock_structure_no_sequence
+    from utils.protein_utils import create_mock_structure_no_sequence
     
     # Create mock structure
     structure = create_mock_structure_no_sequence(length=50)
