@@ -4,6 +4,8 @@ Enhanced reward computation for MCTS-guided inverse folding.
 This module provides sophisticated, length-aware reward functions for proteins
 of different sizes, taking into account biophysical properties and structural
 constraints that vary with protein length.
+
+Now includes real structure evaluation metrics from DPLM-2 framework.
 """
 
 import numpy as np
@@ -11,6 +13,13 @@ import torch
 from typing import Dict, Tuple, Optional, List
 import math
 from collections import Counter
+
+try:
+    from .structure_evaluation import create_structure_evaluator
+    STRUCTURE_EVAL_AVAILABLE = True
+except ImportError:
+    print("Warning: Structure evaluation not available, using fallback")
+    STRUCTURE_EVAL_AVAILABLE = False
 
 
 class LengthAwareRewardComputation:
@@ -23,7 +32,26 @@ class LengthAwareRewardComputation:
     - Large proteins (>300): Emphasize global structure compatibility
     """
     
-    def __init__(self):
+    def __init__(self, use_real_structure_eval: bool = True):
+        """
+        Initialize reward computation.
+        
+        Args:
+            use_real_structure_eval: Whether to use real structure evaluation metrics
+        """
+        # Initialize structure evaluator
+        self.use_real_structure_eval = use_real_structure_eval and STRUCTURE_EVAL_AVAILABLE
+        if self.use_real_structure_eval:
+            try:
+                self.structure_evaluator = create_structure_evaluator()
+                print("Real structure evaluation enabled")
+            except Exception as e:
+                print(f"Failed to initialize structure evaluator: {e}")
+                self.structure_evaluator = None
+                self.use_real_structure_eval = False
+        else:
+            self.structure_evaluator = None
+        
         # Amino acid properties
         self.hydrophobicity_scores = {
             'A': 1.8, 'R': -4.5, 'N': -3.5, 'D': -3.5, 'C': 2.5,
@@ -48,7 +76,7 @@ class LengthAwareRewardComputation:
     def compute_reward(self, sequence: str, structure: Dict, 
                       detailed: bool = False) -> float:
         """
-        Compute length-aware reward for a protein sequence.
+        Compute length-aware reward for a protein sequence with inverse folding focus.
         
         Args:
             sequence: Amino acid sequence
@@ -58,6 +86,11 @@ class LengthAwareRewardComputation:
         Returns:
             Total reward score (or detailed dictionary)
         """
+        # Handle None sequence gracefully
+        if sequence is None:
+            self.logger.warning("Received None sequence, using fallback reward")
+            return 0.5 if not detailed else {'total_reward': 0.5, 'error': 'None sequence'}
+        
         length = len(sequence)
         
         # Get length-specific weights
@@ -70,13 +103,19 @@ class LengthAwareRewardComputation:
         diversity_score = self._compute_diversity_reward(sequence)
         stability_score = self._compute_stability_reward(sequence, length)
         
-        # Weighted combination
+        # Add inverse folding specific components
+        inverse_folding_score = self._compute_inverse_folding_score(sequence, structure)
+        naturalness_score = self._compute_naturalness_score(sequence)
+        
+        # Weighted combination with inverse folding focus
         total_reward = (
             weights['structure'] * structure_score +
             weights['hydrophobicity'] * hydrophobicity_score +
             weights['charge'] * charge_score +
             weights['diversity'] * diversity_score +
-            weights['stability'] * stability_score
+            weights['stability'] * stability_score +
+            0.3 * inverse_folding_score +  # Higher weight for inverse folding
+            0.2 * naturalness_score
         )
         
         if detailed:
@@ -87,6 +126,8 @@ class LengthAwareRewardComputation:
                 'charge_balance': charge_score,
                 'sequence_diversity': diversity_score,
                 'stability_score': stability_score,
+                'inverse_folding_score': inverse_folding_score,
+                'naturalness_score': naturalness_score,
                 'length': length,
                 'weights': weights
             }
@@ -125,34 +166,109 @@ class LengthAwareRewardComputation:
     
     def _compute_structure_compatibility(self, sequence: str, structure: Dict) -> float:
         """
-        Compute structure-sequence compatibility score.
+        Compute structure-sequence compatibility score using real structure evaluation.
         
-        This is a placeholder for actual structure compatibility metrics
-        like TM-score, GDT-TS, or learned compatibility functions.
+        Now uses DPLM-2 evaluation framework:
+        - Self-consistency evaluation (fold sequence, compare to reference)
+        - TM-score calculation
+        - RMSD measurement
+        - pLDDT confidence scoring
+        """
+        if self.use_real_structure_eval and self.structure_evaluator:
+            return self._compute_real_structure_compatibility(sequence, structure)
+        else:
+            return self._compute_mock_structure_compatibility(sequence, structure)
+    
+    def _compute_real_structure_compatibility(self, sequence: str, structure: Dict) -> float:
+        """
+        Real structure compatibility using DPLM-2 evaluation framework.
+        """
+        try:
+            # Evaluate designability using self-consistency
+            designability_results = self.structure_evaluator.evaluate_designability(
+                sequence, structure, rmsd_threshold=2.0
+            )
+            
+            # Extract key metrics
+            sc_tmscore = designability_results['sc_tmscore']
+            sc_rmsd = designability_results['bb_rmsd']  # Fixed: use bb_rmsd key
+            plddt = designability_results['plddt']
+            seq_recovery = designability_results['seq_recovery']
+            
+            # Compute composite compatibility score
+            # TM-score: higher is better (0-1)
+            tmscore_component = sc_tmscore
+            
+            # RMSD: lower is better, normalize to 0-1 scale
+            # Good RMSD: 0-2Å -> score 1.0-0.5, Poor RMSD: >5Å -> score ~0
+            rmsd_component = max(0.0, 1.0 - sc_rmsd / 5.0)
+            
+            # pLDDT: confidence score, normalize to 0-1
+            plddt_component = plddt / 100.0
+            
+            # For inverse folding, sequence recovery is not meaningful (no reference sequence)
+            # Focus on self-consistency metrics: TM-score, RMSD, pLDDT
+            
+            # Weight components based on protein length (no sequence recovery)
+            length = len(sequence)
+            if length < 100:      # Small proteins: emphasize local accuracy (RMSD)
+                weights = {'tmscore': 0.35, 'rmsd': 0.45, 'plddt': 0.20}
+            elif length < 300:    # Medium proteins: balanced
+                weights = {'tmscore': 0.45, 'rmsd': 0.35, 'plddt': 0.20}
+            else:                 # Large proteins: emphasize global structure (TM-score)
+                weights = {'tmscore': 0.55, 'rmsd': 0.25, 'plddt': 0.20}
+            
+            # Composite score (self-consistency only, no sequence recovery)
+            compatibility = (
+                tmscore_component * weights['tmscore'] +
+                rmsd_component * weights['rmsd'] +
+                plddt_component * weights['plddt']
+            )
+            
+            # Store detailed metrics for debugging
+            if not hasattr(self, '_last_structure_metrics'):
+                self._last_structure_metrics = {}
+            
+            self._last_structure_metrics.update({
+                'sc_tmscore': sc_tmscore,
+                'sc_rmsd': sc_rmsd,
+                'plddt': plddt,
+                'seq_recovery': seq_recovery,
+                'compatibility_score': compatibility
+            })
+            
+            return max(0.0, min(1.0, compatibility))
+            
+        except Exception as e:
+            print(f"Warning: Real structure evaluation failed: {e}, using fallback")
+            return self._compute_mock_structure_compatibility(sequence, structure)
+    
+    def _compute_mock_structure_compatibility(self, sequence: str, structure: Dict) -> float:
+        """
+        Fallback mock compatibility based on sequence properties.
         """
         length = len(sequence)
         
-        # Mock compatibility based on sequence properties
-        # In practice, this would use actual structure prediction/comparison
-        
         # Factor 1: Length consistency
-        target_length = structure.get('length', length)
+        target_length = structure.get('target_length', structure.get('length', length))
         length_penalty = abs(length - target_length) / max(length, target_length)
         
-        # Factor 2: Mock local structure compatibility
-        # This could be replaced with actual secondary structure prediction
+        # Factor 2: Hydrophobic fraction (proxy for foldability)
         hydrophobic_residues = sum(1 for aa in sequence if self.hydrophobicity_scores.get(aa, 0) > 2.0)
         hydrophobic_fraction = hydrophobic_residues / length
+        hydrophobic_score = 1.0 - abs(hydrophobic_fraction - 0.35)  # Target ~35% hydrophobic
         
-        # Factor 3: Mock global structure score
-        # This could be replaced with actual fold recognition or energy functions
-        global_score = 0.7 + 0.3 * np.random.random()  # Placeholder
+        # Factor 3: Charge balance (proxy for stability)
+        positive = sum(1 for aa in sequence if aa in "KRH")
+        negative = sum(1 for aa in sequence if aa in "DE")
+        net_charge = abs(positive - negative)
+        charge_score = max(0.0, 1.0 - net_charge / (length * 0.1))
         
         # Combine factors
         compatibility = (
-            (1.0 - length_penalty) * 0.3 +
-            (1.0 - abs(hydrophobic_fraction - 0.3)) * 0.3 +
-            global_score * 0.4
+            (1.0 - length_penalty) * 0.4 +
+            hydrophobic_score * 0.4 +
+            charge_score * 0.2
         )
         
         return max(0.0, min(1.0, compatibility))
@@ -276,6 +392,104 @@ class LengthAwareRewardComputation:
         )
         
         return max(0.0, min(1.0, stability_score))
+
+    def _compute_inverse_folding_score(self, sequence: str, structure: Dict) -> float:
+        """Compute score for how well sequence matches target structure."""
+        score = 0.0
+        
+        # Score based on length compatibility
+        target_length = structure.get('target_length', len(sequence))
+        if abs(len(sequence) - target_length) <= 2:
+            score += 0.3
+        elif abs(len(sequence) - target_length) <= 5:
+            score += 0.1
+        
+        # Score based on hydrophobicity profile matching (if available)
+        if 'hydrophobicity_profile' in structure:
+            profile = structure['hydrophobicity_profile']
+            matches = 0
+            for i, (aa, expected_hydro) in enumerate(zip(sequence, profile)):
+                if i < len(profile):
+                    aa_hydro = self.hydrophobicity_scores.get(aa, 0.0)
+                    # Reward for matching hydrophobicity pattern
+                    if (expected_hydro > 0 and aa_hydro > 0) or (expected_hydro < 0 and aa_hydro < 0):
+                        matches += 1
+            
+            if len(profile) > 0:
+                match_ratio = matches / min(len(sequence), len(profile))
+                score += 0.4 * match_ratio
+        
+        # Score based on secondary structure propensity
+        ss_score = self._compute_secondary_structure_score(sequence)
+        score += 0.2 * ss_score
+        
+        # Score based on sequence naturalness
+        naturalness = self._compute_naturalness_score(sequence)
+        score += 0.1 * naturalness
+        
+        return min(1.0, score)
+    
+    def _compute_naturalness_score(self, sequence: str) -> float:
+        """Compute how natural the sequence appears."""
+        score = 1.0
+        
+        # Penalty for too many consecutive identical residues
+        for i in range(len(sequence) - 2):
+            if sequence[i] == sequence[i+1] == sequence[i+2]:
+                score -= 0.1
+        
+        # Penalty for extreme amino acid composition
+        aa_counts = {}
+        for aa in sequence:
+            aa_counts[aa] = aa_counts.get(aa, 0) + 1
+        
+        for aa, count in aa_counts.items():
+            frequency = count / len(sequence)
+            if frequency > 0.25:  # Too much of one amino acid
+                score -= 0.1
+            elif frequency > 0.15:  # Moderately high
+                score -= 0.05
+        
+        # Bonus for natural amino acid frequencies
+        natural_freq_sum = 0
+        for aa, count in aa_counts.items():
+            expected_freq = self.natural_frequencies.get(aa, 0.05)
+            actual_freq = count / len(sequence)
+            natural_freq_sum += 1.0 - abs(actual_freq - expected_freq)
+        
+        natural_freq_score = natural_freq_sum / len(aa_counts) if aa_counts else 0
+        score += 0.2 * natural_freq_score
+        
+        return max(0.0, score)
+    
+    def _compute_secondary_structure_score(self, sequence: str) -> float:
+        """Compute secondary structure propensity score."""
+        score = 0.0
+        
+        # Simple secondary structure propensity
+        helix_favoring = "ADEFHIKLMNPQRSTVWY"  # Simplified
+        sheet_favoring = "ACDEFGHIKLMNPQRSTVWY"  # Simplified
+        
+        helix_windows = 0
+        sheet_windows = 0
+        
+        for i in range(len(sequence) - 3):
+            window = sequence[i:i+4]
+            helix_score = sum(1 for aa in window if aa in helix_favoring)
+            sheet_score = sum(1 for aa in window if aa in sheet_favoring)
+            
+            if helix_score >= 3:
+                helix_windows += 1
+            if sheet_score >= 3:
+                sheet_windows += 1
+        
+        # Normalize by sequence length
+        if len(sequence) > 4:
+            helix_ratio = helix_windows / (len(sequence) - 3)
+            sheet_ratio = sheet_windows / (len(sequence) - 3)
+            score = (helix_ratio + sheet_ratio) / 2
+        
+        return min(1.0, score)
 
 
 def compute_detailed_reward_analysis(sequence: str, structure: Dict) -> Dict:
