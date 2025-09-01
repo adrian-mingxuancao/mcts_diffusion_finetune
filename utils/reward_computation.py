@@ -529,4 +529,71 @@ def compute_medium_protein_reward(sequence: str, structure: Dict) -> float:
 def compute_large_protein_reward(sequence: str, structure: Dict) -> float:
     """Optimized reward for large proteins (>300 residues)."""
     reward_computer = LengthAwareRewardComputation()
-    return reward_computer.compute_reward(sequence, structure) 
+    return reward_computer.compute_reward(sequence, structure)
+
+
+# Add the missing compute_biophysical_properties method to LengthAwareRewardComputation
+def _add_biophysical_method():
+    """Add the missing compute_biophysical_properties method."""
+    def compute_biophysical_properties(self, sequence: str) -> float:
+        """
+        Compute biophysical quality score for a protein sequence.
+        
+        This method combines multiple biophysical factors:
+        - Charge balance (avoid extreme charge distributions)
+        - Hydrophobic composition (proper hydrophobic/hydrophilic balance)
+        - Amino acid frequency distribution (similarity to natural proteins)
+        
+        Returns:
+            Float score between 0.0 (poor) and 1.0 (excellent)
+        """
+        if not sequence or len(sequence) == 0:
+            return 0.0
+            
+        length = len(sequence)
+        
+        # Factor 1: Charge balance penalty
+        charged_residues = sum(1 for aa in sequence if aa in "DEKRH")
+        charge_fraction = charged_residues / length
+        
+        # Penalize extreme charge compositions (>30% charged residues)
+        if charge_fraction > 0.30:
+            charge_penalty = (charge_fraction - 0.30) * 2.0  # Linear penalty
+        else:
+            charge_penalty = 0.0
+            
+        # Factor 2: Hydrophobic composition penalty  
+        hydrophobic_residues = sum(1 for aa in sequence if aa in "AILVF")
+        hydrophobic_fraction = hydrophobic_residues / length
+        
+        # Penalize extreme hydrophobic compositions (>40% hydrophobic)
+        if hydrophobic_fraction > 0.40:
+            hydrophobic_penalty = (hydrophobic_fraction - 0.40) * 2.5  # Linear penalty
+        else:
+            hydrophobic_penalty = 0.0
+            
+        # Factor 3: Amino acid frequency deviation from natural proteins
+        sequence_counts = {aa: sequence.count(aa) for aa in "ACDEFGHIKLMNPQRSTVWY"}
+        sequence_freqs = {aa: count/length for aa, count in sequence_counts.items()}
+        
+        # Compute deviation from natural frequencies
+        freq_deviation = 0.0
+        for aa in "ACDEFGHIKLMNPQRSTVWY":
+            natural_freq = self.natural_frequencies.get(aa, 0.05)
+            observed_freq = sequence_freqs.get(aa, 0.0)
+            freq_deviation += abs(observed_freq - natural_freq)
+            
+        # Normalize frequency deviation (max possible deviation ≈ 2.0)
+        freq_penalty = min(1.0, freq_deviation / 2.0)
+        
+        # Combine penalties into quality score
+        total_penalty = charge_penalty + hydrophobic_penalty + freq_penalty * 0.5
+        biophysical_score = max(0.0, 1.0 - total_penalty)
+        
+        return biophysical_score
+    
+    # Add method to the class
+    LengthAwareRewardComputation.compute_biophysical_properties = compute_biophysical_properties
+
+# Execute the patch
+_add_biophysical_method() 

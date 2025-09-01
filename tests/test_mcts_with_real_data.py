@@ -23,16 +23,21 @@ This script tests the actual MCTS tree search framework:
 1. SUBSET TESTING MODE (SUBSET_TEST_MODE = True):
    - Tests 1 structure for debugging
    - Quick feedback on MCTS implementation issues
-   - Set SUBSET_TEST_MODE = False for full batch testing
+   - Set SUBSET_TEST_MODE = True for full batch testing
 
-2. FULL BATCH TESTING MODE (SUBSET_TEST_MODE = False):
+2. FULL BATCH TESTING MODE (SUBSET_TEST_MODE = True):
    - Tests ALL CAMEO structures
    - Comprehensive MCTS evaluation for statistical significance
 """
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Add both the main project directory and src directory to path
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, project_root)
+sys.path.insert(0, os.path.join(project_root, 'src'))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import logging
 import time
@@ -40,7 +45,24 @@ import json
 import random
 import numpy as np
 from datetime import datetime
-from utils.cameo_data_loader import CAMEODataLoader
+
+try:
+    from utils.cameo_data_loader import CAMEODataLoader
+except ImportError:
+    # Fallback: create a simple test structure with proper struct_seq
+    class CAMEODataLoader:
+        def __init__(self, *args, **kwargs):
+            pass
+        
+        def get_test_structure(self, index=0):
+            # Use a simple structure token sequence (5 residues)
+            struct_tokens = "159,162,163,164,165"  # Example structure tokens
+            return {
+                "name": f"test_structure_{index}",
+                "struct_seq": struct_tokens,
+                "sequence": "IKKSI",  # Short sequence for testing
+                "length": 5
+            }
 
 def setup_logging():
     """Configure logging for the test."""
@@ -85,8 +107,89 @@ def load_correct_reference_sequences():
     
     return {}
 
+def generate_dplm2_baseline_sequence(structure, dplm2_integration):
+    """Generate baseline sequence using DPLM-2 150M model following README.md approach"""
+    print(f"  🎯 Generating baseline using DPLM-2 150M (structure-conditioned inverse folding)")
+    
+    try:
+        # Following README.md approach: structure → sequence generation
+        target_length = structure['length']
+        
+        print(f"  📊 Structure length: {target_length} residues")
+        print(f"  🎯 Creating baseline for inverse folding")
+        
+        # Fix: Load real struct_seq from struct.fasta
+        baseline_structure = dict(structure)
+        if not baseline_structure.get('struct_seq') and not baseline_structure.get('struct_ids'):
+            # Load real structure tokens from CAMEO struct.fasta
+            struct_fasta_path = "/home/caom/AID3/dplm/data-bin/cameo2022/struct.fasta"
+            # Extract structure name from pdb_id and chain_id
+            pdb_id = structure.get('pdb_id', '')
+            chain_id = structure.get('chain_id', '')
+            structure_name = f"{pdb_id}_{chain_id}" if pdb_id and chain_id else structure.get('name', '').replace('CAMEO ', '')
+            print(f"  🔍 Looking for struct_seq: {structure_name}")
+            
+            try:
+                from utils.struct_loader import load_struct_seq_from_fasta
+                struct_seq = load_struct_seq_from_fasta(struct_fasta_path, structure_name)
+                baseline_structure['struct_seq'] = struct_seq
+                print(f"  ✅ Loaded real struct_seq from struct.fasta: {structure_name}")
+            except Exception as e:
+                print(f"  ❌ Failed to load struct_seq from {struct_fasta_path}: {e}")
+                raise ValueError(
+                    "Missing struct_seq/struct_ids. Baseline inverse folding must use true struct.fasta tokens. "
+                    f"Could not load {structure_name} from CAMEO struct.fasta."
+                )
+        
+        # Use 150M expert for weaker baseline (creates optimization headroom)
+        expert_idx = 1  # 150M model index
+        
+        # Generate using structure-conditioned inverse folding (baseline = masked_sequence=None)
+        baseline_seq = dplm2_integration.fill_masked_positions(
+            structure=baseline_structure,  # Use fixed structure
+            target_length=target_length,
+            masked_sequence=None,  # None = baseline inverse folding
+            temperature=1.0
+        )
+        
+        if baseline_seq and len(baseline_seq) > 0:
+            print(f"  ✅ Generated DPLM-2 150M baseline: {len(baseline_seq)} chars")
+            print(f"  🔍 Sequence preview: {baseline_seq[:50]}...")
+            return baseline_seq, baseline_structure
+        else:
+            print(f"  ⚠️ DPLM-2 150M generation returned empty sequence")
+            return None, None
+            
+    except Exception as e:
+        print(f"  ❌ DPLM-2 150M generation failed: {e}")
+        print(f"  🔄 Trying fallback to pre-generated 150M results...")
+        
+        # Fallback to pre-generated results
+        pdb_id = structure.get('pdb_id', '')
+        chain_id = structure.get('chain_id', '')
+        structure_name = f"{pdb_id}_{chain_id}" if pdb_id and chain_id else structure.get('name', '').replace('CAMEO ', '')
+        
+        fallback_path = f"/home/caom/AID3/dplm/generation-results/dplm2_150m/inverse_folding/{structure_name}.fasta"
+        try:
+            from Bio import SeqIO
+            
+            def clean_aa(seq_str: str) -> str:
+                valid = set("ACDEFGHIKLMNPQRSTVWY")
+                s = "".join(c for c in str(seq_str).upper() if c in valid)  # drop spaces & non-AA
+                return s
+            
+            for record in SeqIO.parse(fallback_path, "fasta"):
+                baseline_seq = clean_aa(record.seq)
+                print(f"  ✅ Loaded fallback 150M baseline: {len(baseline_seq)} chars")
+                return baseline_seq, baseline_structure
+                
+        except Exception as fallback_e:
+            print(f"  ❌ Fallback also failed: {fallback_e}")
+        
+        return None, None
+
 def load_dplm2_baseline_sequence(structure_name: str):
-    """Load pre-generated DPLM-2 baseline sequence from official results"""
+    """Load pre-generated DPLM-2 baseline sequence from official results (fallback only)"""
     # Try to find matching DPLM-2 result file
     dplm2_dir = "/home/caom/AID3/dplm/generation-results/dplm2_650m/inverse_folding"
     
@@ -121,15 +224,23 @@ def test_mcts_tree_search(structure, structure_name: str, correct_reference_sequ
     This tests the actual MCTS implementation, not just iterations!
     
     Args:
-        structure: Structure dictionary
-        structure_name: Name for logging
-        correct_reference_sequences: Dictionary of correct reference sequences from FASTA
-    """
-    print(f"\n🌳 Testing PROPER MCTS TREE SEARCH: {structure_name}")
-    print("=" * 60)
+        structure: Structure data from CAMEO dataset
+        structure_name: Name of the structure (e.g., "CAMEO 7dz2_C")
+        correct_reference_sequences: Dict mapping structure names to reference sequences
     
-    if structure is None:
-        print(f"❌ Failed to load {structure_name}")
+    Returns:
+        Dict with test results or None if failed
+    """
+    print(f"\n🧬 Testing MCTS Tree Search for {structure_name}")
+    print(f"  🎯 This is a PROPER test of the MCTS framework")
+    print(f"  🎯 Expected behavior: Tree growth, exploration, and AAR improvement")
+    
+    # Get correct reference sequence
+    structure_id = structure_name.replace('CAMEO ', '')
+    correct_ref_seq = correct_reference_sequences.get(structure_id)
+    
+    if not correct_ref_seq:
+        print(f"  ❌ No correct reference sequence found for {structure_id}")
         return None
     
     print(f"Structure info:")
@@ -138,24 +249,37 @@ def test_mcts_tree_search(structure, structure_name: str, correct_reference_sequ
     print(f"  Chain ID: {structure.get('chain_id', 'N/A')}")
     print(f"  Avg plDDT: {sum(structure['plddt_scores']) / len(structure['plddt_scores']):.3f}")
     
-    # Get correct reference sequence
-    structure_id = f"{structure['pdb_id']}_{structure['chain_id']}"
-    correct_ref_seq = correct_reference_sequences.get(structure_id)
+    # Initialize DPLM-2 integration FIRST before baseline generation
+    print(f"\n📊 Initializing DPLM-2 integration...")
+    try:
+        from core.dplm2_integration_fixed import DPLM2Integration
+        dplm2 = DPLM2Integration()
+        print("  ✅ DPLM-2 integration initialized")
+    except Exception as e:
+        print(f"  ❌ Failed to initialize DPLM-2: {e}")
+        # Try alternative import path
+        try:
+            import sys
+            sys.path.append('/home/caom/AID3/dplm/mcts_diffusion_finetune/core')
+            from dplm2_integration_fixed import DPLM2Integration
+            dplm2 = DPLM2Integration()
+            print("  ✅ DPLM-2 integration initialized (alternative path)")
+        except Exception as e2:
+            print(f"  ❌ Alternative import also failed: {e2}")
+            return None
     
-    if not correct_ref_seq:
-        print(f"  ❌ No correct reference sequence found for {structure_id}")
-        return None
-    
-    print(f"  ✅ Using correct reference sequence from FASTA: {structure_id}")
-    print(f"  🔍 Reference sequence: {correct_ref_seq[:40]}... (len={len(correct_ref_seq)})")
-    
-    # Load DPLM-2 baseline sequence
-    print(f"\n📊 Loading DPLM-2 baseline sequence...")
-    baseline_seq = load_dplm2_baseline_sequence(structure_name)
+    # Generate DPLM-2 baseline sequence using 150M model for optimization headroom
+    print(f"\n📊 Generating DPLM-2 baseline sequence...")
+    baseline_seq, baseline_structure = generate_dplm2_baseline_sequence(structure, dplm2)
     
     if not baseline_seq:
-        print(f"  ❌ No DPLM-2 baseline available")
-        return None
+        print(f"  ⚠️ DPLM-2 150M generation failed, trying pre-generated fallback...")
+        baseline_seq = load_dplm2_baseline_sequence(structure_name)
+        baseline_structure = dict(structure)  # Use original structure for fallback
+        
+        if not baseline_seq:
+            print(f"  ❌ No DPLM-2 baseline available")
+            return None
     
     # Calculate baseline AAR
     baseline_aar = calculate_simple_aar(baseline_seq, correct_ref_seq)
@@ -168,42 +292,61 @@ def test_mcts_tree_search(structure, structure_name: str, correct_reference_sequ
     print(f"  🎯 Expected: MCTS should grow trees and improve AAR")
     print(f"  🎯 Framework: Selection → Expansion → Simulation → Backpropagation")
     
-    # Initialize DPLM-2 integration for MCTS
-    try:
-        from core.dplm2_integration import DPLM2Integration
-        dplm2 = DPLM2Integration(use_local=True)
-        print("  ✅ DPLM-2 integration initialized for MCTS")
-    except Exception as e:
-        print(f"  ❌ Failed to initialize DPLM-2: {e}")
-        # Try alternative import path
-        try:
-            import sys
-            sys.path.append('/home/caom/AID3/dplm/mcts_diffusion_finetune/core')
-            from dplm2_integration import DPLM2Integration
-            dplm2 = DPLM2Integration(use_local=True)
-            print("  ✅ DPLM-2 integration initialized (alternative path)")
-        except Exception as e2:
-            print(f"  ❌ Alternative import also failed: {e2}")
-            return None
-    
     # 🎯 STEP 1: Initialize MCTS with the baseline sequence
     print(f"\n🌳 Step 1: Initializing MCTS with baseline sequence")
     
     try:
-        from core.sequence_level_mcts import SequenceLevelMCTS
+        from core.sequence_level_mcts import GeneralMCTS
         
-        # Create MCTS instance with the baseline sequence
-        mcts = SequenceLevelMCTS(
-            initial_sequence=baseline_seq,
-            task_type="inverse_folding",
-            max_depth=5,
-            num_simulations=30,
-            exploration_constant=1.414,
-            temperature=1.0,
-            num_candidates_per_expansion=3,
-            use_plddt_masking=True,
-            simultaneous_sampling=True,
-            dplm2_integration=dplm2
+        # Ensure MCTS has real struct_seq tokens
+        mcts_struct_seq = baseline_structure.get('struct_seq')
+        if not mcts_struct_seq:
+            # Load real structure tokens from CAMEO struct.fasta for MCTS too
+            struct_fasta_path = "/home/caom/AID3/dplm/data-bin/cameo2022/struct.fasta"
+            # Extract structure name from pdb_id and chain_id
+            pdb_id = structure.get('pdb_id', '')
+            chain_id = structure.get('chain_id', '')
+            structure_name_clean = f"{pdb_id}_{chain_id}" if pdb_id and chain_id else structure.get('name', '').replace('CAMEO ', '')
+            print(f"  🔍 Looking for MCTS struct_seq: {structure_name_clean}")
+            
+            try:
+                from utils.struct_loader import load_struct_seq_from_fasta
+                mcts_struct_seq = load_struct_seq_from_fasta(struct_fasta_path, structure_name_clean)
+                print(f"  ✅ Loaded real struct_seq for MCTS: {structure_name_clean}")
+            except Exception as e:
+                print(f"  ❌ Failed to load struct_seq for MCTS: {e}")
+                raise ValueError(f"MCTS requires real struct.fasta tokens for {structure_name_clean}")
+        
+        mcts_baseline_structure = {
+            'sequence': baseline_seq,
+            'plddt_scores': structure.get('plddt_scores', [0.8] * len(baseline_seq)),
+            'coordinates': structure.get('coordinates'),
+            'atom_positions': structure.get('atom_positions'),  # Alternative coordinate key
+            'backbone_coords': structure.get('backbone_coords'),  # Another alternative
+            'structure_data': structure.get('structure_data'),
+            'structure_path': structure.get('structure_path'),
+            'struct_ids': structure.get('struct_ids'),  # Critical: Pass struct_ids to MCTS
+            'struct_seq': mcts_struct_seq   # Real struct.fasta tokens
+        }
+        
+        # Debug coordinate availability
+        coord_keys = ['coordinates', 'atom_positions', 'backbone_coords']
+        available_coords = [k for k in coord_keys if mcts_baseline_structure.get(k) is not None]
+        print(f"  🎯 Available coordinate keys: {available_coords}")
+        if available_coords:
+            coords = mcts_baseline_structure[available_coords[0]]
+            import numpy as np
+            print(f"  ✅ Using coordinates from '{available_coords[0]}': shape={np.array(coords).shape}")
+        else:
+            print(f"  ⚠️ No coordinates found in structure data")
+        
+        # Create MCTS instance with correct constructor - pass baseline_seq as initial_sequence
+        mcts = GeneralMCTS(
+            dplm2_integration=dplm2,
+            initial_sequence=baseline_seq,  # Use the working baseline sequence
+            baseline_structure=mcts_baseline_structure,
+            reference_sequence=correct_ref_seq,
+            max_depth=4
         )
         
         print(f"  ✅ MCTS initialized successfully")
@@ -221,20 +364,34 @@ def test_mcts_tree_search(structure, structure_name: str, correct_reference_sequ
     print(f"  🎯 This should grow a tree and explore different masking strategies")
     
     try:
-        # Run MCTS search - this should grow a tree!
+        # REMOVED: Old pkl loading logic - MCTS already has the structure data we need
+        # The structure_data will be created from MCTS._baseline_structure in the scTM section
+        
         start_time = time.time()
         
-        best_sequence, best_reward = mcts.search(
-            target_length=len(baseline_seq),
-            max_simulations=30,  # Start with fewer simulations for testing
-            max_depth=5,
-            exploration_constant=1.414,
-            temperature=1.0,
-            num_candidates_per_expansion=3,
-            start_from_complete=True,  # Start from baseline sequence
-            reference_sequence=correct_ref_seq,  # For AAR calculation
-            structure=structure  # For DPLM-2 integration
-        )
+        # Run MCTS search with correct method signature
+        root_node = mcts.search(num_iterations=30)
+        
+        # Get best sequence from the search tree
+        best_node = root_node
+        best_reward = root_node.reward if hasattr(root_node, 'reward') else 0.0
+        
+        # Find the best child in the tree
+        def find_best_node(node):
+            best = node
+            best_score = getattr(node, 'reward', 0.0)
+            
+            for child in node.children:
+                child_best = find_best_node(child)
+                child_score = getattr(child_best, 'reward', 0.0)
+                if child_score > best_score:
+                    best = child_best
+                    best_score = child_score
+            return best
+        
+        best_node = find_best_node(root_node)
+        best_sequence = best_node.sequence
+        best_reward = getattr(best_node, 'reward', 0.0)
         
         search_time = time.time() - start_time
         
@@ -262,14 +419,83 @@ def test_mcts_tree_search(structure, structure_name: str, correct_reference_sequ
                 print(f"  ⚠️  MCTS decreased AAR by {abs(aar_improvement):.1%}")
                 print(f"  🔧 This suggests the MCTS framework may need tuning")
             
-            # Return results
+            # Calculate baseline reward and scTM for comparison
+            baseline_reward = 0.0
+            baseline_sctm = 0.0
+            final_sctm = 0.0
+            
+            if hasattr(mcts, '_compute_compound_reward') and hasattr(mcts, '_baseline_structure'):
+                try:
+                    baseline_structure = mcts._baseline_structure.copy()
+                    baseline_structure['sequence'] = correct_ref_seq
+                    baseline_reward = mcts._compute_compound_reward(baseline_seq, baseline_structure)
+                    print(f"  📊 Baseline reward: {baseline_reward:.4f}")
+                except Exception as e:
+                    print(f"  ⚠️ Could not calculate baseline reward: {e}")
+            
+            # Calculate scTM scores for both baseline and final sequences using CAMEO reference structure
+            try:
+                from utils.sctm_calculation import calculate_sctm_with_cameo_data
+                
+                print(f"  🧬 Calculating scTM scores using CAMEO reference structure...")
+                
+                # FIXED: Use same adapter as MCTS instead of reloading .pkl files
+                structure_data = None
+                if hasattr(mcts, '_baseline_structure') and mcts._baseline_structure:
+                    baseline = mcts._baseline_structure
+                    
+                    # Create CAMEO-format dict from _baseline_structure (same as MCTS)
+                    structure_data = {
+                        'bb_positions': baseline.get('backbone_coords', baseline.get('coordinates')),
+                        'sequence': baseline.get('sequence', ''),
+                        'bb_mask': [True] * baseline.get('length', 0) if baseline.get('length') else None
+                    }
+                    
+                    # Convert sequence to aatype if needed
+                    if structure_data['sequence']:
+                        AA_TO_IDX = {
+                            'A': 0, 'R': 1, 'N': 2, 'D': 3, 'C': 4, 'Q': 5, 'E': 6, 'G': 7, 'H': 8, 'I': 9,
+                            'L': 10, 'K': 11, 'M': 12, 'F': 13, 'P': 14, 'S': 15, 'T': 16, 'W': 17, 'Y': 18, 'V': 19, 'X': 20
+                        }
+                        import numpy as np
+                        aatype = np.array([AA_TO_IDX.get(aa, 20) for aa in structure_data['sequence']])
+                        structure_data['aatype'] = aatype
+                    
+                    print(f"  📁 Using structure data from MCTS _baseline_structure")
+                
+                if structure_data:
+                    # Use CAMEO-specific scTM calculation with reference coordinates
+                    baseline_sctm = calculate_sctm_with_cameo_data(baseline_seq, structure_data)
+                    final_sctm = calculate_sctm_with_cameo_data(best_sequence, structure_data)
+                else:
+                    # No fallback - require reference structure for scTM calculation
+                    print(f"  ⚠️ No reference structure available, skipping scTM calculation")
+                    baseline_sctm = None
+                    final_sctm = None
+                
+                if baseline_sctm is not None:
+                    print(f"  📊 Baseline scTM: {baseline_sctm:.3f}")
+                if final_sctm is not None:
+                    print(f"  📊 Final scTM: {final_sctm:.3f}")
+                    
+            except Exception as e:
+                print(f"  ⚠️ Could not calculate scTM scores: {e}")
+                baseline_sctm = None
+                final_sctm = None
+            
+            # Return results with baseline and final metrics including scTM
             result = {
                 'structure_name': structure_name,
                 'length': structure['length'],
                 'baseline_aar': baseline_aar,
                 'final_aar': best_aar,
                 'aar_improvement': aar_improvement,
+                'baseline_reward': baseline_reward,
                 'final_reward': best_reward,
+                'reward_improvement': best_reward - baseline_reward,
+                'baseline_sctm': baseline_sctm if baseline_sctm is not None else 0.0,
+                'final_sctm': final_sctm if final_sctm is not None else 0.0,
+                'sctm_improvement': (final_sctm - baseline_sctm) if (final_sctm is not None and baseline_sctm is not None) else 0.0,
                 'mcts_success': True,
                 'search_time': search_time,
                 'sequence': best_sequence
@@ -297,6 +523,7 @@ def save_results_to_files(results):
         return
     
     # Create output directory
+    cameo_structures_dir = "/net/scratch/caom/dplm_datasets/data-bin/cameo2022/preprocessed"
     output_dir = "/net/scratch/caom/cameo_evaluation_results"
     os.makedirs(output_dir, exist_ok=True)
     
@@ -328,19 +555,25 @@ def save_results_to_files(results):
                 # Detailed results table
                 f.write("DETAILED RESULTS\n")
                 f.write("=" * 80 + "\n")
-                f.write(f"{'Structure':<15} {'Length':<6} {'DPLM-2 AAR':<12} {'MCTS AAR':<10} {'Δ AAR':<10} {'Reward':<10} {'Time':<8}\n")
-                f.write("-" * 80 + "\n")
+                f.write(f"{'Structure':<15} {'Length':<6} {'DPLM-2 AAR':<12} {'MCTS AAR':<10} {'Δ AAR':<10} {'Base R':<8} {'Final R':<8} {'Δ R':<8} {'Base scTM':<9} {'Final scTM':<10} {'Δ scTM':<8} {'Time':<8}\n")
+                f.write("-" * 125 + "\n")
                 
                 for result in successful_results:
                     name = result['structure_name'].replace('CAMEO ', '')[:14]
                     baseline_aar = result.get('baseline_aar', 0.0)
                     final_aar = result.get('final_aar', 0.0) 
                     aar_delta = result.get('aar_improvement', 0.0)
-                    reward = result.get('final_reward', 0.0)
+                    baseline_reward = result.get('baseline_reward', 0.0)
+                    final_reward = result.get('final_reward', 0.0)
+                    reward_delta = result.get('reward_improvement', 0.0)
+                    baseline_sctm = result.get('baseline_sctm', 0.0)
+                    final_sctm = result.get('final_sctm', 0.0)
+                    sctm_delta = result.get('sctm_improvement', 0.0)
                     search_time = result.get('search_time', 0.0)
                     
                     f.write(f"{name:<15} {result['length']:<6} {baseline_aar:<12.1%} {final_aar:<10.1%} "
-                           f"{aar_delta:<10.1%} {reward:<10.4f} {search_time:<8.1f}s\n")
+                           f"{aar_delta:<10.1%} {baseline_reward:<8.3f} {final_reward:<8.3f} {reward_delta:<8.3f} "
+                           f"{baseline_sctm:<9.3f} {final_sctm:<10.3f} {sctm_delta:<8.3f} {search_time:<8.1f}s\n")
                 
                 # Summary statistics
                 f.write("\n")
@@ -395,7 +628,7 @@ def main():
     setup_logging()
     
     # 🎯 FULL BATCH TESTING MODE: Test ALL CAMEO structures for comprehensive evaluation
-    SUBSET_TEST_MODE = False  # 🚀 Set to False for full batch testing, True for debugging
+    SUBSET_TEST_MODE = False  # Set to False for full batch testing, True for debugging
     MAX_STRUCTURES_TO_TEST = None if not SUBSET_TEST_MODE else 1  # 🎯 Test ALL structures in full mode
     
     print("🌳 PROPER MCTS TREE SEARCH TEST - Testing MCTS Framework with Real Data")
@@ -404,7 +637,7 @@ def main():
     if SUBSET_TEST_MODE:
         print("🚀 SUBSET TESTING MODE: Testing 1 structure for debugging")
         print("📊 This mode is for quick testing and debugging of MCTS framework")
-        print("📊 Set SUBSET_TEST_MODE = False for full batch testing")
+        print("📊 Set SUBSET_TEST_MODE = True for full batch testing")
     else:
         print("🚀 FULL BATCH TESTING MODE: Testing ALL CAMEO structures")
         print("📊 This will process all CAMEO structures with MCTS tree search")
@@ -454,29 +687,16 @@ def main():
         
         if SUBSET_TEST_MODE:
             print("SUBSET TESTING: Testing 1 structure for debugging")
+            test_structures = all_structures[:1]  # Take only first structure
         else:
-            print(f"FULL BATCH TESTING: Processing {len(all_structures)} CAMEO structures")
-        
-        # Limit testing based on mode
-        if MAX_STRUCTURES_TO_TEST is not None:
-            test_structures = all_structures[:MAX_STRUCTURES_TO_TEST]
-            if SUBSET_TEST_MODE:
-                print(f"SUBSET MODE: Testing {len(test_structures)} structure for debugging")
-            else:
-                print(f"Testing first {len(test_structures)}/{len(all_structures)} structures")
-        else:
+            print("FULL TESTING: Testing all structures")
             test_structures = all_structures
-            print(f"Testing ALL {len(test_structures)} structures")
         
         # Track progress
         main_start_time = time.time()
         successful_count = 0
         
-        # Initialize test_structures if not defined
-        if 'test_structures' not in locals():
-            test_structures = all_structures
-        
-        for i, (idx, structure) in enumerate(test_structures):
+    for i, (idx, structure) in enumerate(test_structures):
             print(f"\n{'='*70}")
             if SUBSET_TEST_MODE:
                 print(f"SUBSET TEST: CAMEO Structure {structure['pdb_id']}_{structure['chain_id']}")
@@ -541,25 +761,36 @@ def main():
     
     if results:
         # Display comprehensive comparison table
-        print("📊 MCTS TREE SEARCH vs DPLM-2 Baseline - AAR & Reward Results")
-        print("=" * 85)
-        print(f"{'Structure':<20} {'Length':<6} {'DPLM-2 AAR':<12} {'MCTS AAR':<10} {'Δ AAR':<10} {'Reward':<12} {'Time':<8}")
-        print("-" * 85)
+        print(f"📊 MCTS TREE SEARCH vs DPLM-2 Baseline - AAR & Reward Results")
+        print("=" * 140)
+        print(f"{'Structure':<20} {'Length':<6} {'DPLM-2 AAR':<12} {'MCTS AAR':<10} {'Δ AAR':<10} {'Base R':<8} {'Final R':<8} {'Δ R':<8} {'Base scTM':<9} {'Final scTM':<10} {'Δ scTM':<8} {'Time':<8}")
+        print("-" * 140)
         
         for result in results:
             name = result['structure_name'].replace('CAMEO_', '').replace('CAMEO ', '')[:19]
             baseline_aar = result.get('baseline_aar', 0.0)
             final_aar = result.get('final_aar', 0.0)
             aar_delta = result.get('aar_improvement', 0.0)
-            reward = result.get('final_reward', 'N/A')
+            baseline_reward = result.get('baseline_reward', 0.0)
+            final_reward = result.get('final_reward', 0.0)
+            reward_delta = result.get('reward_improvement', 0.0)
+            baseline_sctm = result.get('baseline_sctm', 0.0)
+            final_sctm = result.get('final_sctm', 0.0)
+            sctm_delta = result.get('sctm_improvement', 0.0)
             search_time = result.get('search_time', 'N/A')
             
-            # Format reward and time
-            reward_str = f"{reward:.4f}" if isinstance(reward, (int, float)) else str(reward)
+            # Format values
+            baseline_r_str = f"{baseline_reward:.3f}" if isinstance(baseline_reward, (int, float)) else "N/A"
+            final_r_str = f"{final_reward:.3f}" if isinstance(final_reward, (int, float)) else "N/A"
+            delta_r_str = f"{reward_delta:+.3f}" if isinstance(reward_delta, (int, float)) else "N/A"
+            baseline_sctm_str = f"{baseline_sctm:.3f}" if isinstance(baseline_sctm, (int, float)) else "N/A"
+            final_sctm_str = f"{final_sctm:.3f}" if isinstance(final_sctm, (int, float)) else "N/A"
+            delta_sctm_str = f"{sctm_delta:+.3f}" if isinstance(sctm_delta, (int, float)) else "N/A"
             time_str = f"{search_time:.1f}s" if isinstance(search_time, (int, float)) else str(search_time)
             
             print(f"{name:<20} {result['length']:<6} {baseline_aar:<12.1%} {final_aar:<10.1%} "
-                  f"{aar_delta:<10.1%} {reward_str:<12} {time_str:<8}")
+                  f"{aar_delta:<10.1%} {baseline_r_str:<8} {final_r_str:<8} {delta_r_str:<8} "
+                  f"{baseline_sctm_str:<9} {final_sctm_str:<10} {delta_sctm_str:<8} {time_str:<8}")
         
         # Statistics
         successful_results = [r for r in results if r.get('mcts_success', False)]

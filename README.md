@@ -99,13 +99,21 @@ best_sequence, best_reward = mcts.search(structure, target_length=50)
 ## 🔧 Setup
 
 ```bash
+srun --partition=general --gres=gpu:1 --cpus-per-task=4 --mem=32G --time=2:00:00 --pty bash
+
 # Activate environment  
 export PATH="/net/scratch/caom/dplm_env/bin:$PATH"
 
 # Set CUDA path
 export PYTHONPATH=/home/caom/.cache/torch_extensions/py39_cu121/attn_core_inplace_cuda:$PYTHONPATH
 
+# Set cache directories to /net/scratch/ to avoid disk quota issues
+export HF_HOME=/net/scratch/caom/.cache/huggingface
+export TRANSFORMERS_CACHE=/net/scratch/caom/.cache/huggingface/transformers
+export TORCH_HOME=/net/scratch/caom/.cache/torch
+
 # Test framework
+cd /home/caom/AID3/dplm/mcts_diffusion_finetune
 python tests/test_mcts_with_real_data.py
 ```
 
