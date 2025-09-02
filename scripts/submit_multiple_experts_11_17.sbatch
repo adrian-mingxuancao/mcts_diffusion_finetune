@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=cameo_mcts_eval
+#SBATCH --job-name=cameo_multiexpert_11_17
 #SBATCH --partition=general
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=11:00:00  # 🎯 FIXED: Within 12-hour limit for general partition
-#SBATCH --output=/net/scratch/caom/cameo_evaluation_%j.out
-#SBATCH --error=/net/scratch/cameo_evaluation_%j.err
+#SBATCH --time=8:00:00  # 8 hours should be enough for 7 structures
+#SBATCH --output=/net/scratch/caom/cameo_multiexpert_11_17_%j.out
+#SBATCH --error=/net/scratch/caom/cameo_multiexpert_11_17_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=caom@example.com
 
 # Print job information
 echo "======================================================================"
-echo "CAMEO 2022 MCTS Evaluation Job"
+echo "CAMEO 2022 Multiple Experts Rollout - Structures 11-17"
 echo "======================================================================"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Start time: $(date)"
@@ -47,120 +47,106 @@ echo ""
 # Create output directory
 OUTPUT_DIR="/net/scratch/caom/cameo_evaluation_results"
 mkdir -p $OUTPUT_DIR
-LOG_FILE="$OUTPUT_DIR/evaluation_log_$(date +%Y%m%d_%H%M%S).txt"
+LOG_FILE="$OUTPUT_DIR/multiple_experts_11_17_log_$(date +%Y%m%d_%H%M%S).txt"
 
 echo "Output directory: $OUTPUT_DIR"
 echo "Log file: $LOG_FILE"
 echo "Results will be saved automatically by the Python script"
 echo ""
 
-# Run comprehensive evaluation
+# Run multiple experts evaluation on structures 11-17
 echo "======================================================================"
-echo "Starting MCTS ABLATION STUDY (random_no_expert + single_expert)..."
+echo "Starting MULTIPLE EXPERTS rollout on CAMEO structures 11-17..."
 echo "======================================================================"
-echo "This will run ablation studies comparing MCTS expansion strategies"
-echo "Expected duration: Several hours (4 tests per structure)"
+echo "This will run multiple experts MCTS on the remaining structures"
+echo "Expected duration: 6-8 hours for 7 structures"
 echo "Progress will be saved to: $OUTPUT_DIR"
 echo ""
-echo "🎯 ABLATION SCOPE:"
-echo "• CAMEO 2022 structures (subset for testing)"
+echo "🎯 MULTIPLE EXPERTS SCOPE:"
+echo "• CAMEO 2022 structures 11-17 (7 structures)"
 echo "• DPLM-2 150M baseline sequences for all tests"
-echo "• 4 ablation tests per structure:"
-echo "  - random_no_expert: Random fill expansion (no DPLM-2 rollouts)"
-echo "  - single_expert_0: 650M expert only (3 children per expansion)"
-echo "  - single_expert_1: 150M expert only (3 children per expansion)"
-echo "  - single_expert_2: 3B expert only (3 children per expansion)"
-echo "• AAR improvement tracking for each ablation"
+echo "• Multiple experts rollout: 3 experts, 3 rollouts each, 2 children selected"
+echo "• AAR improvement tracking for each structure"
+echo "• Results saved automatically to JSON"
 echo ""
 echo "⏱️  TIME CONSTRAINTS:"
 echo "• General partition limit: 12 hours maximum"
-echo "• Job timeout: 10 hours (safe margin)"
+echo "• Job timeout: 8 hours (safe margin)"
 echo "• 30 MCTS iterations per test for efficiency"
 echo "• Results saved automatically to JSON"
 
-# Set a timeout for the Python script (10 hours to be safe)
-TIMEOUT_HOURS=10
+# Set a timeout for the Python script (7 hours to be safe)
+TIMEOUT_HOURS=7
 TIMEOUT_SECONDS=$((TIMEOUT_HOURS * 3600))
 
 echo "Setting timeout: ${TIMEOUT_HOURS}h (${TIMEOUT_SECONDS}s)"
-echo "Starting evaluation at: $(date)"
+echo "Starting multiple experts evaluation at: $(date)"
 echo ""
 
-timeout $TIMEOUT_SECONDS python tests/mcts_tree_search_ablation.py \
+# Run the ablation script with multiple experts mode on structures 11-17
+timeout $TIMEOUT_SECONDS python tests/mcts_tree_search_ablation.py 11 18 \
     2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=$?
 
-# Check if evaluation completedccessfully
+# Check if evaluation completed successfully
 if [ $EXIT_CODE -eq 0 ]; then
     echo ""
     echo "======================================================================"
-    echo "✅ CAMEO evaluation completed successfully!"
+    echo "✅ Multiple experts evaluation completed successfully!"
     echo "======================================================================"
     echo "Log saved to: $LOG_FILE"
     
-    # Find the most recent results and summary files
-    LATEST_JSON=$(ls -t $OUTPUT_DIR/mcts_vs_dplm2_results_*.json 2>/dev/null | head -1)
-    LATEST_SUMMARY=$(ls -t $OUTPUT_DIR/mcts_vs_dplm2_summary_*.txt 2>/dev/null | head -1)
+    # Find the most recent results file
+    LATEST_JSON=$(ls -t $OUTPUT_DIR/mcts_ablation_results_*.json 2>/dev/null | head -1)
     
-    if [ -f "$LATEST_SUMMARY" ]; then
-        echo "📊 Results summary saved to: $LATEST_SUMMARY"
-        echo "💾 Detailed results saved to: $LATEST_JSON"
+    if [ -f "$LATEST_JSON" ]; then
+        echo "📊 Results saved to: $LATEST_JSON"
         
         # Display final summary
         echo ""
         echo "======================================================================"
-        echo "📊 FINAL SUMMARY"
+        echo "📊 FINAL SUMMARY - Multiple Experts 11-17"
         echo "======================================================================"
-        cat "$LATEST_SUMMARY" | head -50  # Show first 50 lines
+        echo "✅ Multiple experts rollout completed for structures 11-17"
+        echo "📊 Results saved to: $LATEST_JSON"
+        echo "🎯 This completes your CAMEO evaluation dataset!"
         echo ""
-        echo "See full results in: $LATEST_SUMMARY"
-        
-        # 🎯 COMPREHENSIVE EVALUATION SUMMARY
-        echo ""
-        echo "======================================================================"
-        echo "🎯 COMPREHENSIVE CAMEO EVALUATION COMPLETED!"
-        echo "======================================================================"
-        echo "✅ ALL CAMEO structures processed with MCTS optimization"
-        echo "📊 DPLM-2 baseline sequences used from generation-results folder"
-        echo "🔬 AAR improvements calculated for every structure"
-        echo "💾 Results saved incrementally to prevent data loss"
-        echo "📈 Statistical significance achieved with full dataset coverage"
-        echo "📊 COMPREHENSIVE: Processed ALL 17 CAMEO structures without filtering"
+        echo "📈 COMPLETE CAMEO EVALUATION STATUS:"
+        echo "• Structures 0-10: Multiple experts ✅ (already completed)"
+        echo "• Structures 11-17: Multiple experts ✅ (just completed)"
+        echo "• Total: 17 structures with multiple experts rollout"
         
     else
-        echo "⚠️ Summary file not found - check the log for details"
+        echo "⚠️ Results file not found - check the log for details"
     fi
     
 elif [ $EXIT_CODE -eq 124 ]; then
     echo ""
     echo "======================================================================"
-    echo "⏰ CAMEO evaluation TIMED OUT after ${TIMEOUT_HOURS} hours!"
+    echo "⏰ Multiple experts evaluation TIMED OUT after ${TIMEOUT_HOURS} hours!"
     echo "======================================================================"
-    echo "This is expected for processing ALL CAMEO structures"
+    echo "This suggests the evaluation is taking longer than expected"
     echo "Partial results may be available in the output directory"
     echo "Log saved to: $LOG_FILE"
     
     # Check for partial results
-    LATEST_JSON=$(ls -t $OUTPUT_DIR/mcts_vs_dplm2_results_*.json 2>/dev/null | head -1)
+    LATEST_JSON=$(ls -t $OUTPUT_DIR/mcts_ablation_results_*.json 2>/dev/null | head -1)
     if [ -f "$LATEST_JSON" ]; then
         echo "📊 Partial results found: $LATEST_JSON"
-        echo "💡 Consider running with fewer structures or increasing time limit"
+        echo "💡 Consider increasing time limit or reducing iterations"
     fi
     
 else
     echo ""
     echo "======================================================================"
-    echo "❌ CAMEO evaluation failed with exit code: $EXIT_CODE"
+    echo "❌ Multiple experts evaluation failed with exit code: $EXIT_CODE"
     echo "======================================================================"
     echo "Check log file: $LOG_FILE"
-    echo "Error log: /net/scratch/cameo_evaluation_${SLURM_JOB_ID}.err"
+    echo "Error log: /net/scratch/caom/cameo_multiexpert_11_17_${SLURM_JOB_ID}.err"
     exit 1
 fi
 
 echo ""
 echo "Job completed at: $(date)"
 echo "Total wall time: $(squeue -j $SLURM_JOB_ID --format=%M --noheader 2>/dev/null || echo 'Unknown')"
-
-
-

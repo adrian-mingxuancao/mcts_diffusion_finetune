@@ -16,6 +16,8 @@ from .mcts_utils import (
 )
 from .dplm2_integration_fixed import DPLM2Integration
 
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+
 
 @dataclass
 class MCTSNode:
@@ -73,59 +75,67 @@ class MCTSNode:
 
 class GeneralMCTS:
     """
-    Clean MCTS implementation for protein inverse folding.
+    General MCTS implementation for protein sequence optimization.
     
-    Design principles:
-    1. Nodes store complete sequences only (no X tokens)
-    2. Masking happens only during expansion as temporary variables
-    3. Terminal condition based on depth/budget, not masks
-    4. Single value bookkeeping system (value_sum)
-    5. Pure reward evaluation in simulation
+    Uses complete sequences only (no masked sequences in nodes).
+    Masking happens only during expansion as temporary variables.
     """
     
     def __init__(self, dplm2_integration: DPLM2Integration, initial_sequence: str = None,
                  reference_sequence: str = None, baseline_structure: Dict = None, 
-                 max_depth: int = 4, num_candidates_per_expansion: int = 6):
+                 max_depth: int = 4, num_candidates_per_expansion: int = 6,
+                 ablation_mode: str = "multi_expert",   # {"multi_expert","random_no_expert","single_expert"}
+                 single_expert_id: int = 0,             # used when ablation_mode == "single_expert"
+                 k_rollouts_per_expert: int = 3,        # per-expert rollouts
+                 num_children_select: int = 2):         # children kept after scoring
         """
-        Initialize MCTS with complete sequence only.
+        Initialize MCTS with DPLM-2 integration.
         
         Args:
-            dplm2_integration: DPLM-2 integration instance
-            initial_sequence: Complete baseline sequence (no X tokens)
-            reference_sequence: Reference for AAR calculation
-            baseline_structure: Structure data with pLDDT scores
+            dplm2_integration: DPLM-2 model integration
+            initial_sequence: Starting complete sequence (no X tokens)
+            reference_sequence: Target sequence for AAR calculation
+            baseline_structure: Structure data with coordinates and metadata
             max_depth: Maximum tree depth
-            num_candidates_per_expansion: Number of children per expansion
+            num_candidates_per_expansion: Number of candidates to generate per expansion
+            ablation_mode: Ablation study mode
+            single_expert_id: Expert ID for single expert mode
+            k_rollouts_per_expert: Rollouts per expert
+            num_children_select: Number of children to select
         """
         self.dplm2_integration = dplm2_integration
-        self._baseline_structure = baseline_structure
+        self._baseline_structure = baseline_structure or {}
         self.reference_sequence = reference_sequence
         self.max_depth = max_depth
         self.num_candidates_per_expansion = num_candidates_per_expansion
-        
-        # Initialize sequence cache for reward computation
+
+        # Store ablation knobs
+        self.ablation_mode = ablation_mode
+        self.single_expert_id = single_expert_id
+        self.k_rollouts_per_expert = k_rollouts_per_expert
+        self.num_children_select = num_children_select
+
+        # Sequence cache for reward computation
         self.sequence_cache = SequenceCache()
         
         # Track seen sequences to avoid duplicates
         self.seen_sequences = set()
         
-        # Use provided initial sequence or generate with DPLM2-150M
-        if initial_sequence and len(initial_sequence) > 0:
-            self.initial_sequence = initial_sequence
-            print(f"✅ Using provided initial sequence (length: {len(initial_sequence)})")
-        else:
-            print("🧬 No initial sequence provided, generating with DPLM2-150M...")
-            self.initial_sequence = self._generate_initial_sequence_with_dplm2_150m()
-            
-            # Validate generated sequence
-            if not self.initial_sequence or len(self.initial_sequence) == 0:
-                print("⚠️ Generated sequence is empty, using reference sequence as fallback")
-                self.initial_sequence = reference_sequence if reference_sequence else "A" * 100
+        # Store initial sequence
+        self.initial_sequence = initial_sequence
         
-        print(f"🌳 MCTS initialized: max_depth={max_depth}, candidates_per_expansion={num_candidates_per_expansion}")
+        # Fix scTM inputs by setting baseline sequence
+        if self._baseline_structure and initial_sequence:
+            self._baseline_structure['sequence'] = initial_sequence
+        
+        print(f"🌳 GeneralMCTS initialized:")
+        print(f"   Max depth: {max_depth}")
+        print(f"   Candidates per expansion: {num_candidates_per_expansion}")
+        print(f"   Ablation mode: {ablation_mode}")
+        if ablation_mode == "single_expert":
+            print(f"   Single expert ID: {single_expert_id}")
+        print(f"   Initial sequence length: {len(initial_sequence) if initial_sequence else 'None'}")
         print(f"   Reference sequence length: {len(reference_sequence) if reference_sequence else 'None'}")
-        print(f"   Initial sequence length: {len(self.initial_sequence)}")
-        print(f"   Baseline structure keys: {list(baseline_structure.keys()) if baseline_structure else 'None'}")
         
     def search(self, num_iterations: int = 100, max_depth: int = None,
                exploration_constant: float = 1.414, structure: Dict = None) -> 'MCTSNode':
@@ -217,10 +227,10 @@ class GeneralMCTS:
                 novelty_bonus = getattr(child, 'novelty_vs_parent', 0.0) * 0.1
                 
                 # Combined PH-UCT score
-                ph_uct_score = exploitation + exploration + entropy_bonus + novelty_bonus
+                score = exploitation + exploration + entropy_bonus + novelty_bonus
                 
-                if ph_uct_score > best_score:
-                    best_score = ph_uct_score
+                if score > best_score:
+                    best_score = score
                     best_child = child
             
             node = best_child
@@ -254,36 +264,43 @@ class GeneralMCTS:
             masked[i] = 'X'
         masked_seq = ''.join(masked)
         
-        # Multi-expert rollouts: each expert does K rollouts, take max from each
-        candidates = []
-        expert_ids = [0, 1, 2]  # 650M, 150M, 3B models
-        k_rollouts_per_expert = 3  # Each expert does 3 rollouts
-        
-        print(f"🎯 Multi-expert expansion: {len(expert_ids)} experts × {k_rollouts_per_expert} rollouts")
-        if len(seq) > 0:
-            print(f"   Mask size: {len(mask)} positions ({len(mask)/len(seq)*100:.1f}%)")
-        else:
-            print(f"   ⚠️ Empty sequence detected, cannot compute mask percentage")
-        
-        for expert_id in expert_ids:
+        candidates: List[str] = []
+
+        # =========================
+        # ABLATION BRANCHES
+        # =========================
+
+        # (A) RANDOM FILL — no experts at all
+        if self.ablation_mode == "random_no_expert":
+            print("🎲 Ablation: RANDOM (no experts).")
+            # generate num_candidates_per_expansion random fills
+            for _ in range(self.num_candidates_per_expansion):
+                proposal = list(seq)
+                for i in mask:
+                    proposal[i] = random.choice(AMINO_ACIDS)
+                complete_seq = ''.join(proposal)
+                candidates.append(complete_seq)
+
+            # score & keep top-N (use same multi-critic reward)
+            scored = [(self._compute_reward(c), c) for c in candidates]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top_candidates = [c for _, c in scored[:self.num_children_select]]
+
+        # (B) SINGLE EXPERT — one expert only, spawn 3 children directly
+        elif self.ablation_mode == "single_expert":
+            expert_id = int(self.single_expert_id) % 3  # 0,1,2
+            print(f"🧪 Ablation: SINGLE EXPERT id={expert_id}. Rollouts={self.k_rollouts_per_expert}")
             expert_candidates = []
-            
-            # Each expert does K rollouts
-            for rollout in range(k_rollouts_per_expert):
+            for r in range(self.k_rollouts_per_expert):
                 try:
-                    # Ensure structure has struct_ids for expert generation
                     base_struct = self._baseline_structure.copy()
                     if 'struct_ids' not in base_struct and 'struct_seq' not in base_struct:
-                        # This should not happen if CAMEO loader worked correctly
-                        print(f"   ⚠️ Warning: No struct_ids/struct_seq in structure, using seq-only generation")
-                        # Use sequence-only generation as fallback
-                        with self.dplm2_integration._with_model(self.dplm2_integration.expert_models[expert_id]):
-                            raw = self.dplm2_integration.fill_masked_positions_seq_only(
-                                masked_sequence=masked_seq,
-                                temperature=0.9
-                            )
+                        print("   ⚠️ No struct tokens; using seq-only fill as fallback")
+                        with self.dplm2_integration._with_model(
+                            self.dplm2_integration.expert_models[expert_id]
+                        ):
+                            raw = self.dplm2_integration.fill_masked_positions_seq_only(masked_seq, temperature=0.9)
                     else:
-                        # Generate with expert using structure-conditional generation
                         raw = self.dplm2_integration.generate_with_expert(
                             expert_id=expert_id,
                             structure=base_struct,
@@ -291,45 +308,69 @@ class GeneralMCTS:
                             masked_sequence=masked_seq,
                             temperature=1.0
                         )
-                    
-                    # Apply patch to get complete sequence
                     complete_seq = apply_patch(seq, raw, mask)
-                    
-                    # Fast proxy scoring for this rollout
-                    aar_score = compute_fast_aar(complete_seq, self.reference_sequence)
-                    expert_candidates.append((aar_score, complete_seq))
-                    
+                    aar = compute_fast_aar(complete_seq, self.reference_sequence)
+                    expert_candidates.append((aar, complete_seq))
                 except Exception as e:
-                    print(f"Expert {expert_id} rollout {rollout} failed: {e}")
-                    continue
-            
-            # Take the best candidate from this expert's rollouts
-            if expert_candidates:
-                expert_candidates.sort(reverse=True, key=lambda x: x[0])  # Sort by AAR score
-                best_score, best_seq = expert_candidates[0]
-                candidates.append(best_seq)
-                print(f"   Expert {expert_id}: best AAR = {best_score:.3f}")
-            else:
-                print(f"   Expert {expert_id}: no valid candidates")
-        
-        # Rank all expert maxes and take top 2 as children
-        if candidates:
-            # Score all candidates with full multi-critic reward
-            scored_candidates = []
-            for cand in candidates:
-                reward = self._compute_reward(cand)
-                scored_candidates.append((reward, cand))
-            
-            # Sort by reward and take top candidates
-            scored_candidates.sort(reverse=True, key=lambda x: x[0])
-            top_candidates = [cand for _, cand in scored_candidates[:2]]  # Take top 2
-            
-            print(f"🏆 Selected {len(top_candidates)} children from {len(candidates)} expert candidates")
-            for i, (reward, cand) in enumerate(scored_candidates[:2]):
-                print(f"   Child {i+1}: reward = {reward:.3f}")
+                    print(f"   Expert {expert_id} rollout {r} failed: {e}")
+
+            if not expert_candidates:
+                print("   ⚠️ No valid candidates from single expert")
+                return []
+
+            # Rank by proxy AAR then full reward, and KEEP 3 children directly
+            expert_candidates.sort(reverse=True, key=lambda x: x[0])
+            # refine top pool with full reward
+            refined = [(self._compute_reward(c), c) for _, c in expert_candidates[:max(3, self.num_children_select)]]
+            refined.sort(key=lambda x: x[0], reverse=True)
+            top_candidates = [c for _, c in refined[:3]]  # force 3 as per your request
+            print(f"🏆 SINGLE EXPERT: spawned {len(top_candidates)} children")
+
+        # (C) DEFAULT MULTI-EXPERT (original behavior)
         else:
-            top_candidates = []
-            print("⚠️ No valid candidates generated")
+            expert_ids = [0, 1, 2]
+            k_rollouts = self.k_rollouts_per_expert
+            print(f"🎯 Multi-expert expansion: {len(expert_ids)} experts × {k_rollouts} rollouts")
+            if len(seq) > 0:
+                print(f"   Mask size: {len(mask)} positions ({len(mask)/len(seq)*100:.1f}%)")
+
+            per_expert_bests = []
+            for expert_id in expert_ids:
+                expert_pool = []
+                for r in range(k_rollouts):
+                    try:
+                        base_struct = self._baseline_structure.copy()
+                        if 'struct_ids' not in base_struct and 'struct_seq' not in base_struct:
+                            print(f"   ⚠️ No struct tokens; seq-only fallback for expert {expert_id}")
+                            with self.dplm2_integration._with_model(
+                                self.dplm2_integration.expert_models[expert_id]
+                            ):
+                                raw = self.dplm2_integration.fill_masked_positions_seq_only(masked_seq, temperature=0.9)
+                        else:
+                            raw = self.dplm2_integration.generate_with_expert(
+                                expert_id=expert_id,
+                                structure=base_struct,
+                                target_length=len(seq),
+                                masked_sequence=masked_seq,
+                                temperature=1.0
+                            )
+                        complete_seq = apply_patch(seq, raw, mask)
+                        aar = compute_fast_aar(complete_seq, self.reference_sequence)
+                        expert_pool.append((aar, complete_seq))
+                    except Exception as e:
+                        print(f"Expert {expert_id} rollout {r} failed: {e}")
+                if expert_pool:
+                    expert_pool.sort(reverse=True, key=lambda x: x[0])
+                    per_expert_bests.append(expert_pool[0][1])
+
+            if not per_expert_bests:
+                print("⚠️ No valid candidates generated")
+                return []
+
+            scored = [(self._compute_reward(c), c) for c in per_expert_bests]
+            scored.sort(reverse=True, key=lambda x: x[0])
+            top_candidates = [c for _, c in scored[:self.num_children_select]]
+            print(f"🏆 Selected {len(top_candidates)} children from {len(per_expert_bests)} expert candidates")
         
         # Create child nodes (all store complete sequences)
         children = []
@@ -337,7 +378,10 @@ class GeneralMCTS:
             child = MCTSNode(sequence=cand, parent=node, depth=node.depth + 1)
             
             # Cache PH-UCT bonuses
-            child.entropy_proposals = len(candidates) / 10.0
+            if self.ablation_mode == "single_expert":
+                child.entropy_proposals = self.k_rollouts_per_expert / 10.0
+            else:
+                child.entropy_proposals = len(candidates) / 10.0
             child.novelty_vs_parent = sum(1 for a, b in zip(cand, seq) if a != b) / len(seq)
             
             children.append(child)
@@ -468,35 +512,6 @@ class GeneralMCTS:
         # Cache result
         self.sequence_cache.rewards[seq_hash] = reward
         return reward
-    
-    def _generate_initial_sequence_with_dplm2_150m(self) -> str:
-        """
-        Generate initial sequence using DPLM2-150M model with structure conditioning.
-        This provides the baseline sequence for MCTS optimization.
-        """
-        print("🧬 Generating initial sequence with DPLM2-150M (structure-conditional)...")
-        
-        try:
-            if 'X' in initial_seq:
-                print(f"⚠️ Generated sequence contains X tokens, cleaning...")
-                initial_seq = initial_seq.replace('X', 'A')  # Replace with Alanine
-            
-            print(f"✅ Generated initial sequence: {initial_seq[:50]}... (length: {len(initial_seq)})")
-            return initial_seq
-            
-        except Exception as e:
-            print(f"❌ Failed to generate initial sequence: {e}")
-            # Fallback to reference sequence if available
-            if self.reference_sequence:
-                print("🔄 Using reference sequence as fallback")
-                return self.reference_sequence
-            else:
-                # Last resort: generate random sequence
-                import random
-                amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
-                fallback_seq = ''.join(random.choices(amino_acids, k=100))
-                print(f"🎲 Using random fallback sequence: {fallback_seq[:50]}...")
-                return fallback_seq
     
     def _compute_sequence_plddt(self, sequence: str) -> Optional[List[float]]:
         """
