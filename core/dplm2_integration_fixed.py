@@ -154,46 +154,61 @@ class DPLM2Integration:
             raise
     
     def _load_expert_models(self):
-        """Load multiple expert DPLM-2 models with different sizes."""
-        print(f"🎯 Loading {len(self.expert_models)} expert models...")
+        """Initialize expert model registry for on-demand loading."""
+        print(f"🎯 Expert models available: {len(self.expert_models)}")
         
+        # Don't load all models at once - use on-demand loading
         for i, expert_name in enumerate(self.expert_models):
-            try:
-                if expert_name == self.model_name:
-                    # Use main model if same
-                    print(f"   Expert {i+1}: {expert_name} (same as main model)")
-                    self.expert_instances[expert_name] = self.model
-                    continue
-                
-                print(f"   Expert {i+1}: Loading {expert_name}...")
-                
-                # Load expert model
-                expert_model = DPLM2_MODEL_CLASS.from_pretrained(
-                    expert_name,
-                    from_huggingface=True
-                )
-                expert_model.eval()
-                expert_model.to(self.device)
-                
-                # Share the main tokenizer to avoid import issues
-                expert_model.tokenizer = self.tokenizer
-                
-                # Apply 3B model patch if needed
-                if '3b' in expert_name.lower():
-                    self._patch_3b_model_forward(expert_model)
-                
-                self.expert_instances[expert_name] = expert_model
-                print(f"   Expert {i+1}: ✅ Loaded {expert_name}")
-                
-            except Exception as e:
-                print(f"   Expert {i+1}: ❌ Failed to load {expert_name}: {e}")
-                # Use main model as fallback
+            if expert_name == self.model_name:
+                # Use main model if same
+                print(f"   Expert {i}: {expert_name} (main model)")
                 self.expert_instances[expert_name] = self.model
-                continue
+            else:
+                print(f"   Expert {i}: {expert_name} (on-demand loading)")
+                self.expert_instances[expert_name] = None  # Placeholder
         
-        print(f"🎯 Expert models loaded: {len(self.expert_instances)}/{len(self.expert_models)}")
-        if self.expert_instances:
-            print(f"   Available experts: {list(self.expert_instances.keys())}")
+        print(f"✅ Expert registry initialized")
+    
+    def _load_expert_on_demand(self, expert_name):
+        """Load expert model only when needed to save memory."""
+        if self.expert_instances.get(expert_name) is not None:
+            return self.expert_instances[expert_name]
+        
+        try:
+            print(f"🔄 Loading expert on-demand: {expert_name}")
+            
+            # Load expert model
+            expert_model = DPLM2_MODEL_CLASS.from_pretrained(
+                expert_name,
+                from_huggingface=True
+            )
+            expert_model.eval()
+            expert_model.to(self.device)
+            expert_model.tokenizer = self.tokenizer
+            
+            # Apply 3B model patch if needed
+            if '3b' in expert_name.lower():
+                self._patch_3b_model_forward(expert_model)
+            
+            self.expert_instances[expert_name] = expert_model
+            print(f"✅ Expert loaded: {expert_name}")
+            return expert_model
+            
+        except Exception as e:
+            print(f"❌ Failed to load expert {expert_name}: {e}")
+            # Use main model as fallback
+            self.expert_instances[expert_name] = self.model
+            return self.model
+    
+    def _unload_expert(self, expert_name):
+        """Unload expert model to free memory."""
+        if expert_name in self.expert_instances and expert_name != self.model_name:
+            model = self.expert_instances[expert_name]
+            if model is not None and model != self.model:
+                del model
+                torch.cuda.empty_cache()
+                self.expert_instances[expert_name] = None
+                print(f"🗑️ Unloaded expert: {expert_name}")
     
     def _load_structure_tokenizer(self):
         print("Loading struct_tokenizer (no-ESM path)...")
@@ -413,9 +428,167 @@ class DPLM2Integration:
         print(f"   🧪 struct_ids L(before)={original_len}, added_bos={bos_id is not None}, added_eos={eos_id is not None}, L(final)={t.shape[1]}")
         return t, t.shape[1]
     
+    def get_masked_logits(self, structure: Dict, masked_sequence: str, expert_id: int = None) -> Tuple[torch.Tensor, List[int]]:
+        """
+        Extract raw logits at masked positions for uncertainty tracking.
+        
+        Args:
+            structure: Structure data with struct_seq/struct_ids
+            masked_sequence: Sequence with X tokens at masked positions
+            expert_id: Optional expert model to use
+            
+        Returns:
+            (logits_at_masked, masked_positions): Logits tensor and position indices
+        """
+        if expert_id is not None and self.expert_instances:
+            expert_names = list(self.expert_instances.keys())
+            if expert_id < len(expert_names):
+                expert_name = expert_names[expert_id]
+                expert_model = self.expert_instances[expert_name]
+                original_model = self.model
+                self.model = expert_model
+            else:
+                expert_model = None
+        else:
+            expert_model = None
+        
+        try:
+            # Create batch for forward pass
+            batch = self._create_dplm2_batch(structure, len(masked_sequence), masked_sequence)
+            
+            # Get masked positions
+            masked_positions = [i for i, c in enumerate(masked_sequence) if c == 'X']
+            if not masked_positions:
+                return torch.empty(0, self.model.config.vocab_size), []
+            
+            # Forward pass to get logits
+            with torch.no_grad():
+                outputs = self.model(**batch)
+                logits = outputs.logits  # [batch_size, seq_len, vocab_size]
+                
+                # Extract logits at masked positions in AA sequence part
+                # Account for structure tokens + AA CLS token offset
+                struct_len = batch['input_ids'].shape[1] - len(masked_sequence) - 2  # -2 for CLS/EOS
+                aa_start_idx = struct_len + 1  # +1 for AA CLS token
+                
+                masked_logits = []
+                for pos in masked_positions:
+                    aa_pos_in_batch = aa_start_idx + pos
+                    if aa_pos_in_batch < logits.shape[1]:
+                        masked_logits.append(logits[0, aa_pos_in_batch, :])
+                
+                if masked_logits:
+                    return torch.stack(masked_logits), masked_positions
+                else:
+                    return torch.empty(0, self.model.config.vocab_size), []
+                    
+        except Exception as e:
+            print(f"Error getting masked logits: {e}")
+            return torch.empty(0, self.model.config.vocab_size if hasattr(self.model, 'config') else 20), []
+        finally:
+            if expert_model is not None:
+                self.model = original_model
+
+    def compute_ensemble_surprisal(self, structure: Dict, candidate_sequence: str, 
+                                 masked_positions: List[int]) -> float:
+        """
+        Compute ensemble surprisal of candidate sequence at masked positions.
+        
+        Args:
+            structure: Structure data
+            candidate_sequence: Complete candidate sequence
+            masked_positions: Positions that were masked during generation
+            
+        Returns:
+            Average surprisal across experts and positions
+        """
+        if not masked_positions or not self.expert_instances:
+            return 0.0
+        
+        total_surprisal = 0.0
+        num_experts = len(self.expert_instances)
+        
+        # Create masked version for logit extraction
+        masked_seq = list(candidate_sequence)
+        for pos in masked_positions:
+            if pos < len(masked_seq):
+                masked_seq[pos] = 'X'
+        masked_seq_str = ''.join(masked_seq)
+        
+        for expert_id in range(num_experts):
+            try:
+                logits, _ = self.get_masked_logits(structure, masked_seq_str, expert_id)
+                if logits.numel() == 0:
+                    continue
+                
+                # Convert to probabilities
+                probs = torch.softmax(logits, dim=-1)
+                
+                # Compute surprisal for actual amino acids at masked positions
+                for i, pos in enumerate(masked_positions):
+                    if i < logits.shape[0] and pos < len(candidate_sequence):
+                        aa = candidate_sequence[pos]
+                        aa_idx = self._aa_to_idx(aa)
+                        if aa_idx is not None and aa_idx < probs.shape[1]:
+                            prob = probs[i, aa_idx].item()
+                            surprisal = -torch.log(torch.clamp(torch.tensor(prob), min=1e-10)).item()
+                            total_surprisal += surprisal
+                            
+            except Exception as e:
+                print(f"Error computing surprisal for expert {expert_id}: {e}")
+                continue
+        
+        # Average across experts and positions
+        total_positions = len(masked_positions) * num_experts
+        return total_surprisal / max(1, total_positions)
+    
+    def compute_predictive_entropy(self, structure: Dict, masked_sequence: str, expert_id: int = None) -> float:
+        """
+        Compute predictive entropy at masked positions for uncertainty estimation.
+        
+        Args:
+            structure: Structure data
+            masked_sequence: Sequence with X tokens at masked positions
+            expert_id: Expert model to use (None for main model)
+            
+        Returns:
+            Average entropy across masked positions
+        """
+        try:
+            logits, masked_positions = self.get_masked_logits(structure, masked_sequence, expert_id)
+            if logits.numel() == 0:
+                return 0.0
+            
+            # Convert to probabilities and compute entropy
+            probs = torch.softmax(logits, dim=-1)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            
+            # Entropy = -sum(p * log(p))
+            entropy = -(probs * log_probs).sum(dim=-1)
+            
+            # Average entropy across positions
+            return entropy.mean().item()
+            
+        except Exception as e:
+            print(f"Error computing predictive entropy: {e}")
+            return 0.0
+    
+    def _aa_to_idx(self, aa: str) -> Optional[int]:
+        """Convert amino acid to tokenizer index."""
+        try:
+            if hasattr(self.model.tokenizer, 'encode'):
+                tokens = self.model.tokenizer.encode(aa, add_special_tokens=False)
+                return tokens[0] if tokens else None
+            return None
+        except:
+            # Fallback mapping
+            aa_map = {'A': 0, 'C': 1, 'D': 2, 'E': 3, 'F': 4, 'G': 5, 'H': 6, 'I': 7, 'K': 8, 'L': 9,
+                     'M': 10, 'N': 11, 'P': 12, 'Q': 13, 'R': 14, 'S': 15, 'T': 16, 'V': 17, 'W': 18, 'Y': 19}
+            return aa_map.get(aa.upper())
+
     def generate_with_expert(self, expert_id: int, structure: Dict, target_length: int, 
                            masked_sequence: str = None, temperature: float = 1.0) -> str:
-        """Generate sequence using specific expert model for UNMASKING (not conditional generation)."""
+        """Generate sequence using specific expert model with memory management."""
         if not self.expert_instances:
             # Fallback to main model
             return self.fill_masked_positions(structure, masked_sequence, target_length, temperature)
@@ -425,7 +598,9 @@ class DPLM2Integration:
             expert_id = expert_id % len(expert_names)
         
         expert_name = expert_names[expert_id]
-        expert_model = self.expert_instances[expert_name]
+        
+        # Load expert on-demand and manage memory
+        expert_model = self._load_expert_on_demand(expert_name)
         
         # Verify this is UNMASKING, not conditional generation
         # Convert to string to avoid array ambiguity
@@ -455,8 +630,14 @@ class DPLM2Integration:
                 print(f"   ✅ Unmasking complete: {masked_count} positions filled")
             
             return result
+        except Exception as e:
+            print(f"Error in DPLM-2 generation: {e}")
+            raise RuntimeError(f"DPLM-2 generation failed: {e}. Cannot proceed without a valid sequence.")
         finally:
             self.model = original_model
+            # Unload expert to free memory if it's not the main model
+            if expert_name != self.model_name:
+                self._unload_expert(expert_name)
     
     def _create_dplm2_batch(self, structure: Dict, target_length: int, masked_sequence: str = None) -> Dict:
         """
@@ -647,8 +828,8 @@ class DPLM2Integration:
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 output = self.model.generate(
                     input_tokens=batch["input_tokens"],
-                    max_iter=500,  # Increased from 100
-                    temperature=0.7,  # Reduced from 1.0
+                    max_iter=150,  # Tuned down from 500 for faster decoding
+                    temperature=0.8,  # Reduced from 1.0
                     unmasking_strategy="deterministic",
                     sampling_strategy="argmax",
                     partial_masks=batch["partial_mask"],  # Use batch partial_mask

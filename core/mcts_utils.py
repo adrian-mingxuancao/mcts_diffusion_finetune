@@ -2,8 +2,9 @@
 Utility functions for MCTS masked diffusion search.
 """
 import hashlib
-from typing import List, Set, Tuple, Dict, Any
 import random
+from typing import List, Set, Tuple, Dict, Any
+import torch
 import math
 
 
@@ -16,14 +17,17 @@ def apply_patch(parent_seq: str, proposal_seq: str, mask_idxs: Set[int]) -> str:
     return ''.join(out)
 
 
-def compute_mask_schedule(sequence: str, plddt_scores: List[float], depth: int, max_depth: int = 10) -> Set[int]:
+def compute_mask_schedule(sequence: str, plddt_scores: List[float], depth: int, max_depth: int = 4) -> Set[int]:
     """
-    Smarter progressive masking strategy with higher starting thresholds.
+    Adaptive masking strategy that maintains meaningful exploration at all depths.
     
-    Key principle: Start with meaningful mask sizes, progressively focus on worst regions.
+    Key improvements:
+    - Minimum mask sizes to ensure progress at deeper levels
+    - Entropy-based fallback when pLDDT masking is too conservative
+    - Balanced exploration vs exploitation
     """
-    # Smarter thresholds: start higher for meaningful optimization
-    tau_start, tau_end = 0.75, 0.40  # Higher start threshold for more positions
+    # Progressive thresholds but not too aggressive
+    tau_start, tau_end = 0.80, 0.55  # Less aggressive decline
     progress = min(1.0, depth / max_depth) if max_depth > 0 else 0
     tau = tau_start - (tau_start - tau_end) * progress
     
@@ -38,25 +42,26 @@ def compute_mask_schedule(sequence: str, plddt_scores: List[float], depth: int, 
     else:
         mask = []
     
-    # Smarter mask sizing: depth-dependent strategy
+    # Adaptive mask sizing with guaranteed minimums
+    seq_len = len(sequence)
     if depth == 0:
-        # Root: larger mask for exploration (10-20%)
-        min_positions = max(5, int(len(sequence) * 0.10))
-        max_positions = int(len(sequence) * 0.20)
+        # Root: substantial exploration (15-25%)
+        min_positions = max(8, int(seq_len * 0.15))
+        max_positions = int(seq_len * 0.25)
     elif depth <= 2:
-        # Early depths: moderate masks (5-15%)
-        min_positions = max(3, int(len(sequence) * 0.05))
-        max_positions = int(len(sequence) * 0.15)
+        # Mid depths: moderate exploration (8-18%)
+        min_positions = max(5, int(seq_len * 0.08))
+        max_positions = int(seq_len * 0.18)
     else:
-        # Deep levels: focused masks (1-10%)
-        min_positions = 1
-        max_positions = max(5, int(len(sequence) * 0.10))
+        # Deep levels: focused but meaningful (5-12%)
+        min_positions = max(3, int(seq_len * 0.05))
+        max_positions = max(8, int(seq_len * 0.12))
     
     if len(mask) > max_positions:
         # Keep only the lowest confidence positions
         mask = mask[:max_positions]
-    elif len(mask) < min_positions and depth < max_depth:
-        # Add medium confidence positions if needed
+    elif len(mask) < min_positions:
+        # Fallback: add random medium-confidence positions to ensure progress
         medium_conf = [i for i, plddt in enumerate(plddt_scores) 
                       if tau <= plddt < (tau + 0.15)]
         if medium_conf:
@@ -133,7 +138,8 @@ class SequenceCache:
         self.aar_cache = {}
         self.sctm_cache = {}
         self.biophys_cache = {}
-        self.rewards = {}  # Add missing rewards cache
+        self.rewards = {}
+        self.cache = {}  # General cache for deduplication
     
     def get_aar(self, seq_hash: str) -> float:
         return self.aar_cache.get(seq_hash)

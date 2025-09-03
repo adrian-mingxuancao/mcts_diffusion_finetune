@@ -20,15 +20,27 @@ _esmfold_tokenizer = None
 
 
 def load_esmfold_model():
-    """Load ESMFold model using HuggingFace transformers (cached)."""
+    """Load ESMFold model using HuggingFace transformers with memory management."""
     global _esmfold_model, _esmfold_tokenizer
     
     if _esmfold_model is not None:
         return _esmfold_model, _esmfold_tokenizer
     
-    print("🔬 Loading ESMFold model...")
+    print("🔬 Loading ESMFold model with memory management...")
     try:
         from transformers import AutoTokenizer, EsmForProteinFolding
+        from core.memory_manager import get_memory_manager
+        
+        memory_manager = get_memory_manager()
+        
+        # Check if we can load ESMFold
+        if not memory_manager.can_load_model("esmfold"):
+            print("⚠️ Insufficient memory for ESMFold, performing cleanup...")
+            memory_manager.emergency_cleanup()
+            
+            if not memory_manager.can_load_model("esmfold"):
+                print("❌ Still insufficient memory for ESMFold")
+                return None, None
         
         # Load tokenizer and model
         _esmfold_tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
@@ -40,7 +52,10 @@ def load_esmfold_model():
         if torch.cuda.is_available():
             try:
                 _esmfold_model.cuda()
-                print("✅ ESMFold loaded on GPU")
+                # Register with memory manager
+                memory_manager.load_model("esmfold", _esmfold_model)
+                print("✅ ESMFold loaded on GPU with memory management")
+                print(f"   {memory_manager.get_memory_status()}")
             except Exception as e:
                 print(f"⚠️ GPU loading failed: {e}, using CPU")
                 _esmfold_model.cpu()

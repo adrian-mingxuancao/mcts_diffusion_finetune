@@ -1,17 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=cameo_mcts_batch2
+#SBATCH --job-name=cameo_mcts_mode_random
 #SBATCH --partition=general
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=8:00:00
-#SBATCH --output=/net/scratch/caom/cameo_batch2_%j.out
-#SBATCH --error=/net/scratch/caom/cameo_batch2_%j.err
-#SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=caom@example.com
+#SBATCH --output=/net/scratch/caom/cameo_mode_random_%j.out
+#SBATCH --error=/net/scratch/caom/cameo_mode_random_%j.err
 
-# Batch 2: Structures 4-7
-echo "CAMEO MCTS Ablation - Batch 2 (Structures 4-7)"
+echo "CAMEO MCTS Ablation - Mode: random_no_expert (all structures)"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Start time: $(date)"
 
@@ -22,9 +19,9 @@ export HF_HOME=/net/scratch/caom/huggingface_cache
 export TRITON_CACHE_DIR=/net/scratch/caom/triton_cache
 mkdir -p $HF_HOME $TRITON_CACHE_DIR
 
-cd /home/caom/AID3/dplm
+cd /home/caom/AID3/dplm/mcts_diffusion_finetune
 
-# Run batch 2 (structures 4-7)
-timeout 28800 python -m mcts_diffusion_finetune.tests.mcts_tree_search_ablation 4 8
+timeout 28800 python tests/mcts_tree_search_ablation.py --mode random_no_expert
 
-echo "Batch 2 completed at: $(date)"
+echo "Mode random_no_expert completed at: $(date)"
+

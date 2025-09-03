@@ -50,19 +50,17 @@ class MCTSNode:
         """Average reward value."""
         return self.value_sum / max(1, self.visit_count)
     
-    @property
-    def ucb_score(self) -> float:
+    def ucb_score(self, parent_visits: int, exploration_constant: float = 1.414) -> float:
         """PH-UCT score for selection."""
         if self.visit_count == 0:
             return float('inf')
-        parent_visits = max(1, self.parent.visit_count) if self.parent else 1
         return ph_uct_score(
             self.average_value,
             self.visit_count,
             parent_visits,
-            c=1.4,
+            c=exploration_constant,
             w_ent=0.1,
-            w_div=0.05,
+            w_div=0.1,
             entropy_proposals=self.entropy_proposals,
             novelty_vs_parent=self.novelty_vs_parent
         )
@@ -81,89 +79,83 @@ class GeneralMCTS:
     Masking happens only during expansion as temporary variables.
     """
     
-    def __init__(self, dplm2_integration: DPLM2Integration, initial_sequence: str = None,
-                 reference_sequence: str = None, baseline_structure: Dict = None, 
-                 max_depth: int = 4, num_candidates_per_expansion: int = 6,
-                 ablation_mode: str = "multi_expert",   # {"multi_expert","random_no_expert","single_expert"}
-                 single_expert_id: int = 0,             # used when ablation_mode == "single_expert"
-                 k_rollouts_per_expert: int = 3,        # per-expert rollouts
-                 num_children_select: int = 2):         # children kept after scoring
+    def __init__(self, dplm2_integration, reference_sequence: str, baseline_structure: Dict, 
+                 max_depth: int = 3, exploration_constant: float = 1.414, 
+                 num_children_select: int = 2, k_rollouts_per_expert: int = 2,
+                 ablation_mode: str = "multi_expert", single_expert_id: int = 0,
+                 backup_rule: str = "max"):
         """
-        Initialize MCTS with DPLM-2 integration.
+        Initialize MCTS for sequence-level optimization.
         
         Args:
             dplm2_integration: DPLM-2 model integration
-            initial_sequence: Starting complete sequence (no X tokens)
             reference_sequence: Target sequence for AAR calculation
-            baseline_structure: Structure data with coordinates and metadata
-            max_depth: Maximum tree depth
-            num_candidates_per_expansion: Number of candidates to generate per expansion
-            ablation_mode: Ablation study mode
+            baseline_structure: Structure data with coordinates/pLDDT
+            max_depth: Maximum search depth
+            exploration_constant: UCB exploration parameter
+            num_children_select: Number of top children to keep per expansion
+            k_rollouts_per_expert: Number of rollouts per expert
+            ablation_mode: "random_no_expert", "single_expert", or "multi_expert"
             single_expert_id: Expert ID for single expert mode
-            k_rollouts_per_expert: Rollouts per expert
-            num_children_select: Number of children to select
+            backup_rule: "max" for max backup (MCTS), "sum" for sum backup (Monte Carlo)
         """
         self.dplm2_integration = dplm2_integration
-        self._baseline_structure = baseline_structure or {}
         self.reference_sequence = reference_sequence
+        self._baseline_structure = baseline_structure
         self.max_depth = max_depth
-        self.num_candidates_per_expansion = num_candidates_per_expansion
-
-        # Store ablation knobs
+        self.exploration_constant = exploration_constant
+        self.num_children_select = num_children_select
+        self.k_rollouts_per_expert = k_rollouts_per_expert
         self.ablation_mode = ablation_mode
         self.single_expert_id = single_expert_id
-        self.k_rollouts_per_expert = k_rollouts_per_expert
-        self.num_children_select = num_children_select
-
-        # Sequence cache for reward computation
+        self.backup_rule = backup_rule
+        
+        # Derived parameters
+        self.num_candidates_per_expansion = 6  # For random mode
+        
+        # Cache for sequence evaluation
         self.sequence_cache = SequenceCache()
         
         # Track seen sequences to avoid duplicates
         self.seen_sequences = set()
         
-        # Store initial sequence
-        self.initial_sequence = initial_sequence
-        
-        # Fix scTM inputs by setting baseline sequence
-        if self._baseline_structure and initial_sequence:
-            self._baseline_structure['sequence'] = initial_sequence
-        
         print(f"🌳 GeneralMCTS initialized:")
         print(f"   Max depth: {max_depth}")
-        print(f"   Candidates per expansion: {num_candidates_per_expansion}")
+        print(f"   Candidates per expansion: {self.num_candidates_per_expansion}")
         print(f"   Ablation mode: {ablation_mode}")
+        print(f"   Backup rule: {backup_rule}")
         if ablation_mode == "single_expert":
             print(f"   Single expert ID: {single_expert_id}")
-        print(f"   Initial sequence length: {len(initial_sequence) if initial_sequence else 'None'}")
         print(f"   Reference sequence length: {len(reference_sequence) if reference_sequence else 'None'}")
         
-    def search(self, num_iterations: int = 100, max_depth: int = None,
+    def search(self, initial_sequence: str, num_iterations: int = 100, max_depth: int = None,
                exploration_constant: float = 1.414, structure: Dict = None) -> 'MCTSNode':
         """
         Perform MCTS search starting from complete initial sequence.
         
         Args:
+            initial_sequence: Complete starting sequence (no X tokens)
             num_iterations: Number of MCTS iterations
             max_depth: Maximum tree depth (uses instance default if None)
-            exploration_constant: UCB exploration constant
-            structure: Structure data for masking and rewards
+            exploration_constant: UCB exploration parameter
+            structure: Optional structure data to merge with baseline
             
         Returns:
-            Root MCTSNode with search tree
+            Root node of the search tree
         """
         if max_depth is None:
             max_depth = self.max_depth
         
-        # Update baseline structure if new structure provided, but preserve existing one
+        # Merge structure data if provided
         if structure:
             self._baseline_structure.update(structure)
         elif not hasattr(self, '_baseline_structure') or not self._baseline_structure:
             self._baseline_structure = {}
         
         # Root always stores complete initial sequence
-        root = MCTSNode(sequence=self.initial_sequence, depth=0)
+        root = MCTSNode(sequence=initial_sequence, depth=0)
         
-        print(f"🎯 MCTS search starting from complete sequence (length: {len(self.initial_sequence)})")
+        print(f"🎯 MCTS search starting from complete sequence (length: {len(initial_sequence)})")
         
         for iteration in range(num_iterations):
             # Selection: find leaf node using UCB
@@ -202,7 +194,7 @@ class GeneralMCTS:
                 best_node = self._get_best_node(root)
                 print(f"   Best so far: depth={best_node.depth}, reward={best_node.average_value:.3f}")
         
-        # Return root node with complete search tree
+        # Return root node (contains full search tree)
         return root
     
     def _select(self, node: MCTSNode, exploration_constant: float) -> MCTSNode:
@@ -218,16 +210,8 @@ class GeneralMCTS:
             best_score = float('-inf')
             
             for child in node.children:
-                # Standard UCB1 score
-                exploitation = child.average_value
-                exploration = exploration_constant * math.sqrt(math.log(node.visit_count) / child.visit_count)
-                
-                # PH-UCT bonuses (cached during expansion)
-                entropy_bonus = getattr(child, 'entropy_proposals', 0.0) * 0.1
-                novelty_bonus = getattr(child, 'novelty_vs_parent', 0.0) * 0.1
-                
-                # Combined PH-UCT score
-                score = exploitation + exploration + entropy_bonus + novelty_bonus
+                # Use the centralized UCB score calculation
+                score = child.ucb_score(node.visit_count, exploration_constant)
                 
                 if score > best_score:
                     best_score = score
@@ -334,60 +318,133 @@ class GeneralMCTS:
             if len(seq) > 0:
                 print(f"   Mask size: {len(mask)} positions ({len(mask)/len(seq)*100:.1f}%)")
 
-            per_expert_bests = []
+            # Extract predictive uncertainty BEFORE generation for each expert
+            expert_uncertainties = {}
+            base_struct = self._baseline_structure.copy()
             for expert_id in expert_ids:
-                expert_pool = []
+                try:
+                    uncertainty = self.dplm2_integration.compute_predictive_entropy(
+                        base_struct, masked_seq, expert_id
+                    )
+                    expert_uncertainties[expert_id] = uncertainty
+                    print(f"   Expert {expert_id} predictive uncertainty: {uncertainty:.3f}")
+                except Exception as e:
+                    print(f"   Warning: Failed to compute uncertainty for expert {expert_id}: {e}")
+                    expert_uncertainties[expert_id] = 1.0  # Default uncertainty
+
+            # Build single all_candidates list with every rollout across experts
+            all_candidates = []
+            for expert_id in expert_ids:
                 for r in range(k_rollouts):
                     try:
-                        base_struct = self._baseline_structure.copy()
-                        if 'struct_ids' not in base_struct and 'struct_seq' not in base_struct:
-                            print(f"   ⚠️ No struct tokens; seq-only fallback for expert {expert_id}")
-                            with self.dplm2_integration._with_model(
-                                self.dplm2_integration.expert_models[expert_id]
-                            ):
-                                raw = self.dplm2_integration.fill_masked_positions_seq_only(masked_seq, temperature=0.9)
-                        else:
-                            raw = self.dplm2_integration.generate_with_expert(
-                                expert_id=expert_id,
-                                structure=base_struct,
-                                target_length=len(seq),
-                                masked_sequence=masked_seq,
-                                temperature=1.0
-                            )
-                        complete_seq = apply_patch(seq, raw, mask)
-                        aar = compute_fast_aar(complete_seq, self.reference_sequence)
-                        expert_pool.append((aar, complete_seq))
+                        raw = self.dplm2_integration.generate_with_expert(expert_id, base_struct, len(seq), masked_seq, temperature=1.0)
+                        if raw:
+                            complete_seq = apply_patch(seq, raw, mask)
+                            # Use cache-style de-dupe
+                            seq_hash = hash(complete_seq)
+                            if seq_hash not in self.sequence_cache.cache:
+                                aar = compute_fast_aar(complete_seq, self.reference_sequence)
+                                all_candidates.append((aar, complete_seq))
+                                self.sequence_cache.cache[seq_hash] = {'aar': aar}
                     except Exception as e:
                         print(f"Expert {expert_id} rollout {r} failed: {e}")
-                if expert_pool:
-                    expert_pool.sort(reverse=True, key=lambda x: x[0])
-                    per_expert_bests.append(expert_pool[0][1])
+                        continue
 
-            if not per_expert_bests:
-                print("⚠️ No valid candidates generated")
-                return []
-
-            scored = [(self._compute_reward(c), c) for c in per_expert_bests]
-            scored.sort(reverse=True, key=lambda x: x[0])
-            top_candidates = [c for _, c in scored[:self.num_children_select]]
-            print(f"🏆 Selected {len(top_candidates)} children from {len(per_expert_bests)} expert candidates")
+            # TopK from all candidates (not per-expert best)
+            if all_candidates:
+                # Score all candidates once and select TopK
+                scored = [(self._compute_reward(c), c) for _, c in all_candidates]
+                scored.sort(reverse=True, key=lambda x: x[0])
+                top_candidates = [c for _, c in scored[:self.num_children_select]]
+                print(f"🏆 Selected {len(top_candidates)} children from {len(all_candidates)} total rollouts")
+            else:
+                top_candidates = []
         
-        # Create child nodes (all store complete sequences)
+        # Create child nodes with proper entropy calculation
         children = []
         for cand in top_candidates:
             child = MCTSNode(sequence=cand, parent=node, depth=node.depth + 1)
             
-            # Cache PH-UCT bonuses
-            if self.ablation_mode == "single_expert":
-                child.entropy_proposals = self.k_rollouts_per_expert / 10.0
-            else:
-                child.entropy_proposals = len(candidates) / 10.0
-            child.novelty_vs_parent = sum(1 for a, b in zip(cand, seq) if a != b) / len(seq)
+            # Use pre-computed predictive uncertainty (computed BEFORE generation)
+            try:
+                if self.ablation_mode == "random_no_expert":
+                    # Empirical entropy for random fill-in ablation
+                    child.entropy_proposals = self._compute_empirical_entropy(top_candidates, list(mask))
+                elif self.ablation_mode == "single_expert":
+                    # Use pre-computed predictive entropy for single expert
+                    expert_id = int(self.single_expert_id) % 3
+                    child.entropy_proposals = self.dplm2_integration.compute_predictive_entropy(
+                        base_struct, masked_seq, expert_id
+                    )
+                else:
+                    # For multi-expert: compute child-specific ensemble surprisal
+                    try:
+                        child.entropy_proposals = self.dplm2_integration.compute_ensemble_surprisal(
+                            base_struct, cand, list(mask)
+                        )
+                        print(f"   ✅ Computed ensemble surprisal: {child.entropy_proposals:.3f} for child sequence")
+                    except Exception as surprisal_error:
+                        print(f"   Warning: Ensemble surprisal failed: {surprisal_error}")
+                        # Fallback: use average predictive uncertainty across experts
+                        if 'expert_uncertainties' in locals():
+                            child.entropy_proposals = sum(expert_uncertainties.values()) / len(expert_uncertainties)
+                            print(f"   ⚠️ Using fallback average uncertainty: {child.entropy_proposals:.3f}")
+                        else:
+                            child.entropy_proposals = 1.0
+                            print(f"   ⚠️ Using default entropy: 1.0")
+                
+                # Novelty vs parent (Hamming distance normalized)
+                child.novelty_vs_parent = sum(1 for a, b in zip(cand, seq) if a != b) / len(seq)
+                
+                print(f"   Child entropy: {child.entropy_proposals:.3f}, novelty: {child.novelty_vs_parent:.3f}")
+                
+            except Exception as e:
+                print(f"   Warning: Failed to compute entropy/novelty for child: {e}")
+                # Fallback to simple counts
+                child.entropy_proposals = len(top_candidates) / 10.0 if self.ablation_mode != "single_expert" else self.k_rollouts_per_expert / 10.0
+                child.novelty_vs_parent = sum(1 for a, b in zip(cand, seq) if a != b) / len(seq)
             
             children.append(child)
         
         return children
     
+    def _compute_empirical_entropy(self, candidates: List[str], masked_positions: List[int]) -> float:
+        """
+        Compute empirical entropy for random fill-in ablation studies.
+        
+        Args:
+            candidates: List of candidate sequences
+            masked_positions: Positions that were masked during generation
+            
+        Returns:
+            Average empirical entropy across masked positions
+        """
+        if not candidates or not masked_positions:
+            return 0.0
+        
+        total_entropy = 0.0
+        
+        for pos in masked_positions:
+            # Count amino acid frequencies at this position
+            aa_counts = {}
+            for seq in candidates:
+                if pos < len(seq):
+                    aa = seq[pos]
+                    aa_counts[aa] = aa_counts.get(aa, 0) + 1
+            
+            # Compute empirical entropy: H = -sum(p * log(p))
+            total_candidates = len(candidates)
+            entropy = 0.0
+            for count in aa_counts.values():
+                p = count / total_candidates
+                if p > 0:
+                    entropy -= p * math.log(p)
+            
+            total_entropy += entropy
+        
+        # Average entropy across positions
+        return total_entropy / len(masked_positions)
+
     def _simulate(self, node: MCTSNode) -> float:
         """
         Simulate (evaluate) a complete sequence.
@@ -416,45 +473,62 @@ class GeneralMCTS:
             print(f"   Reference: {self.reference_sequence[:50]}...")
             print(f"   Lengths: gen={len(sequence)}, ref={len(self.reference_sequence)}")
         
-        # 2. Calculate scTM score using ESMFold and TMalign (from backup)
+        # 2. Calculate scTM score using ESMFold and TMalign
         sctm_score = 0.0
         try:
-            from utils.sctm_calculation import calculate_sctm_with_cameo_data
+            from utils.sctm_calculation import calculate_sctm_score
+            from utils.cameo_data_loader import CAMEODataLoader
             
             print(f"🧬 Calculating scTM score using ESMFold...")
             
-            # Create CAMEO-format structure data from _baseline_structure (from backup)
-            structure_data = None
+            # Load reference coordinates directly from .pkl file (same as ablation script)
             if hasattr(self, '_baseline_structure') and self._baseline_structure:
                 baseline = self._baseline_structure
+                structure_idx = baseline.get('structure_idx')
                 
-                # Create CAMEO-format dict from _baseline_structure
-                structure_data = {
-                    'bb_positions': baseline.get('backbone_coords', baseline.get('coordinates')),
-                    'sequence': baseline.get('sequence', ''),
-                    'bb_mask': [True] * baseline.get('length', 0) if baseline.get('length') else None
-                }
-                
-                # Convert sequence to aatype if needed
-                if structure_data['sequence']:
-                    AA_TO_IDX = {
-                        'A': 0, 'R': 1, 'N': 2, 'D': 3, 'C': 4, 'Q': 5, 'E': 6, 'G': 7, 'H': 8, 'I': 9,
-                        'L': 10, 'K': 11, 'M': 12, 'F': 13, 'P': 14, 'S': 15, 'T': 16, 'W': 17, 'Y': 18, 'V': 19, 'X': 20
-                    }
-                    import numpy as np
-                    aatype = np.array([AA_TO_IDX.get(aa, 20) for aa in structure_data['sequence']])
-                    structure_data['aatype'] = aatype
-                
-                if structure_data is not None:
-                    sctm_score = calculate_sctm_with_cameo_data(sequence, structure_data)
-                    if sctm_score is not None and sctm_score > 0:
-                        print(f"✅ scTM score: {sctm_score:.3f}")
+                if structure_idx is not None:
+                    # Load coordinates from .pkl file
+                    scTM_loader = CAMEODataLoader(data_path="/home/caom/AID3/dplm/data-bin/cameo2022")
+                    cameo_structure = scTM_loader.get_structure_by_index(structure_idx)
+                    
+                    if cameo_structure:
+                        # Extract reference coordinates (CA atoms)
+                        reference_coords = None
+                        
+                        if 'backbone_coords' in cameo_structure and cameo_structure['backbone_coords'] is not None:
+                            coords = cameo_structure['backbone_coords']
+                            if len(coords.shape) == 3 and coords.shape[1] == 3:
+                                reference_coords = coords[:, 1, :]  # CA atoms at index 1
+                            else:
+                                reference_coords = coords
+                        elif 'coordinates' in cameo_structure and cameo_structure['coordinates'] is not None:
+                            reference_coords = cameo_structure['coordinates']
+                        elif 'atom_positions' in cameo_structure and cameo_structure['atom_positions'] is not None:
+                            coords = cameo_structure['atom_positions']
+                            if len(coords.shape) == 3 and coords.shape[1] >= 2:
+                                reference_coords = coords[:, 1, :]  # CA atoms at index 1
+                            else:
+                                reference_coords = coords
+                        
+                        if reference_coords is not None and hasattr(reference_coords, 'shape'):
+                            sctm_score = calculate_sctm_score(sequence, reference_coords)
+                            if sctm_score is not None and sctm_score > 0:
+                                print(f"✅ scTM score: {sctm_score:.3f}")
+                            else:
+                                print(f"⚠️ scTM calculation returned invalid score: {sctm_score}")
+                                sctm_score = 0.0
+                        else:
+                            print(f"⚠️ No valid reference coordinates found in .pkl file")
+                            sctm_score = 0.0
                     else:
-                        print(f"⚠️ scTM calculation failed, using fallback")
+                        print(f"⚠️ Could not load .pkl file for scTM calculation")
                         sctm_score = 0.0
                 else:
-                    print(f"⚠️ No reference structure data available for scTM calculation")
+                    print(f"⚠️ No structure_idx available for scTM calculation")
                     sctm_score = 0.0
+            else:
+                print(f"⚠️ No baseline structure available for scTM calculation")
+                sctm_score = 0.0
             
         except Exception as e:
             print(f"⚠️ scTM calculation failed: {e}")
@@ -496,9 +570,11 @@ class GeneralMCTS:
             print(f"⚠️ Biophysical calculation failed: {e}, using fallback")
             biophysical_quality = 0.8
         
-        # 4. Combine rewards (85% AAR + 10% scTM + 5% Biophysical) - from backup
-        aar_weight = 0.85
-        sctm_weight = 0.10
+        # 4. Combine rewards (more balanced AAR vs scTM)
+        # Previously: 85% AAR, 10% scTM, 5% Biophysical
+        # Updated:    60% AAR, 35% scTM, 5% Biophysical
+        aar_weight = 0.60
+        sctm_weight = 0.35
         biophysical_weight = 0.05
         
         reward = (aar * aar_weight) + (sctm_score * sctm_weight) + (biophysical_quality * biophysical_weight)
@@ -543,10 +619,15 @@ class GeneralMCTS:
             return None
     
     def _backpropagate(self, node: MCTSNode, reward: float) -> None:
-        """Backpropagate reward up the tree."""
+        """Backpropagate reward up the tree using configurable backup rule."""
         while node is not None:
             node.visit_count += 1
-            node.value_sum += reward
+            if self.backup_rule == "max":
+                # Max backup: W ← max(W, v), Q = W/N
+                node.value_sum = max(node.value_sum, reward * node.visit_count)
+            else:
+                # Sum backup (Monte Carlo average): value_sum += reward
+                node.value_sum += reward
             node = node.parent
     
     def _is_terminal(self, node: MCTSNode, max_depth: int) -> bool:
