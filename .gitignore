@@ -90,5 +90,7 @@ logs/
 # Environment variables
 .env 
 
-debug_baseline_generation.py
+# debug_baseline_generation.py
 debug_tokenization.py
+visualization/
+scripts/

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-MCTS Ablation Runner
+MCTS Ablation Runner for PDB_date Dataset
 
-Runs two ablations:
+Runs ablation studies on PDB_date dataset:
   1) random_no_expert  — MCTS expands with random fills only (no DPLM-2 rollouts)
   2) single_expert_k   — three separate studies with exactly one expert (k in {0,1,2}),
                          each spawning 3 children per expansion from that one expert.
+  3) multi_expert      — uses all experts for comprehensive search
 
 Everything else (masking schedule, reward, logging, saving) mirrors the original script.
 """
@@ -22,11 +23,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import logging
 import numpy as np
 
-# ---- your loader fallback kept verbatim ----
+# ---- PDB loader import ----
 try:
-    from utils.cameo_data_loader import CAMEODataLoader
+    from utils.pdb_data_loader import PDBDataLoader
 except ImportError:
-    class CAMEODataLoader:
+    class PDBDataLoader:
         def __init__(self, *args, **kwargs):
             self.structures = []
         def get_test_structure(self, index=0):
@@ -37,9 +38,10 @@ except ImportError:
                 "length": 5
             }
 
-from core.dplm2_integration import DPLM2Integration
+from core.dplm2_integration_memory_optimized import MemoryOptimizedDPLM2Integration as CleanDPLM2Integration
 from core.sequence_level_mcts import GeneralMCTS
 from Bio import SeqIO
+
 
 def setup_logging():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -51,7 +53,7 @@ def calculate_simple_aar(pred_seq, ref_seq):
     return sum(p==r for p,r in zip(pred_seq[:L], ref_seq[:L]))/L
 
 def load_correct_reference_sequences():
-    reference_fasta = "/home/caom/AID3/dplm/data-bin/cameo2022/aatype.fasta"
+    reference_fasta = "/home/caom/AID3/dplm/data-bin/PDB_date/aatype.fasta"
     seqs = {}
     if os.path.exists(reference_fasta):
         for rec in SeqIO.parse(reference_fasta, "fasta"):
@@ -82,17 +84,17 @@ def generate_dplm2_baseline_sequence(structure, dplm2, structure_idx=None):
     )
     
     if not has_struct_seq and not has_struct_ids:
-        struct_fasta_path = "/home/caom/AID3/dplm/data-bin/cameo2022/struct.fasta"
+        struct_fasta_path = "/home/caom/AID3/dplm/data-bin/PDB_date/struct.fasta"
         pdb_id = structure.get('pdb_id', '')
         chain_id = structure.get('chain_id', '')
-        structure_name = f"{pdb_id}_{chain_id}" if pdb_id and chain_id else structure.get('name', '').replace('CAMEO ', '')
+        structure_name = f"{pdb_id}_{chain_id}" if pdb_id and chain_id else structure.get('name', '').replace('PDB ', '')
         from utils.struct_loader import load_struct_seq_from_fasta
         struct_seq = load_struct_seq_from_fasta(struct_fasta_path, structure_name)
         baseline_structure['struct_seq'] = struct_seq
     # Try inverse folding generation first, fallback to pregenerated if it fails
     pdb_id = structure.get('pdb_id', '')
     chain_id = structure.get('chain_id', '')
-    structure_name = f"{pdb_id}_{chain_id}" if pdb_id and chain_id else structure.get('name', '').replace('CAMEO ', '')
+    structure_name = f"{pdb_id}_{chain_id}" if pdb_id and chain_id else structure.get('name', '').replace('PDB ', '')
     
     # First attempt: Try direct inverse folding generation
     try:
@@ -126,7 +128,7 @@ def generate_dplm2_baseline_sequence(structure, dplm2, structure_idx=None):
 
 def run_one_structure(structure, structure_name, dplm2, correct_reference_sequences, ablation_mode, single_expert_id=None, structure_idx=None, loader=None):
     print(f"\n🧬 [{ablation_mode}{'' if single_expert_id is None else f'_{single_expert_id}'}] {structure_name}")
-    ref_id = structure_name.replace('CAMEO ', '')
+    ref_id = structure_name.replace('PDB ', '')
     ref_seq = correct_reference_sequences.get(ref_id)
     if not ref_seq:
         print(f"  ❌ no reference: {ref_id}")
@@ -191,51 +193,58 @@ def run_one_structure(structure, structure_name, dplm2, correct_reference_sequen
     # Compute scTM scores using ESMFold prediction vs reference structure
     baseline_sctm, final_sctm = None, None
     try:
-        from utils.sctm_calculation import calculate_sctm_score
+        # Use PDB-specific scTM calculation function (defined above)
         
         # Load reference coordinates from .pkl file for scTM calculation
-        # Create a separate loader instance for scTM calculation (uses .pkl files)
-        from utils.cameo_data_loader import CAMEODataLoader
-        scTM_loader = CAMEODataLoader(data_path="/home/caom/AID3/dplm/data-bin/cameo2022/preprocessed")
-        cameo_structure = scTM_loader.get_structure_by_index(structure_idx) if structure_idx is not None else None
-        if cameo_structure:
+        # Use the same loader instance that was passed in
+        pdb_structure = loader.get_structure_by_index(structure_idx) if structure_idx is not None else None
+        if pdb_structure:
+            print(f"  🧬 Loaded PDB structure for scTM calculation")
+            print(f"  🔍 Structure keys: {list(pdb_structure.keys())}")
+            
             # Get reference coordinates (CA atoms)
             reference_coords = None
             
             # Check backbone_coords first (most reliable)
-            if 'backbone_coords' in cameo_structure and cameo_structure['backbone_coords'] is not None:
-                coords = cameo_structure['backbone_coords']
+            if 'backbone_coords' in pdb_structure and pdb_structure['backbone_coords'] is not None:
+                coords = pdb_structure['backbone_coords']
                 if len(coords.shape) == 3 and coords.shape[1] == 3:
                     reference_coords = coords[:, 1, :]  # CA atoms at index 1
                 else:
                     reference_coords = coords
+                print(f"  🧬 Using backbone_coords: {reference_coords.shape}")
             
             # Check coordinates as fallback
-            elif 'coordinates' in cameo_structure and cameo_structure['coordinates'] is not None:
-                reference_coords = cameo_structure['coordinates']
+            elif 'coordinates' in pdb_structure and pdb_structure['coordinates'] is not None:
+                reference_coords = pdb_structure['coordinates']
+                print(f"  🧬 Using coordinates: {reference_coords.shape}")
             
             # Check atom_positions as last resort
-            elif 'atom_positions' in cameo_structure and cameo_structure['atom_positions'] is not None:
-                coords = cameo_structure['atom_positions']
+            elif 'atom_positions' in pdb_structure and pdb_structure['atom_positions'] is not None:
+                coords = pdb_structure['atom_positions']
                 if len(coords.shape) == 3 and coords.shape[1] >= 2:
                     reference_coords = coords[:, 1, :]  # CA atoms at index 1
                 else:
                     reference_coords = coords
+                print(f"  🧬 Using atom_positions: {reference_coords.shape}")
             
             if reference_coords is not None and hasattr(reference_coords, 'shape'):
                 print(f"  🧬 Using reference coordinates for scTM calculation: {reference_coords.shape}")
-                # Calculate scTM: ESMFold prediction vs reference
+                # Calculate scTM: ESMFold prediction vs reference using centralized function
+                from utils.sctm_calculation import calculate_sctm_score
                 baseline_sctm = calculate_sctm_score(baseline_seq, reference_coords)
                 final_sctm = calculate_sctm_score(best_seq, reference_coords)
             else:
-                print(f"  ⚠️ No valid reference coordinates found in .pkl file")
+                print(f"  ⚠️ No valid reference coordinates found in PDB .pkl file")
                 print(f"  🔍 reference_coords type: {type(reference_coords)}")
                 if reference_coords is not None:
                     print(f"  🔍 reference_coords has shape: {hasattr(reference_coords, 'shape')}")
         else:
-            print(f"  ⚠️ Could not load .pkl file for scTM calculation")
+            print(f"  ⚠️ Could not load PDB .pkl file for scTM calculation")
     except Exception as e:
         print(f"  ⚠️ scTM calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
         baseline_sctm, final_sctm = None, None
 
     out = {
@@ -280,7 +289,7 @@ def run_one_structure(structure, structure_name, dplm2, correct_reference_sequen
     return out
 
 def main():
-    print("🧬 MCTS Ablation Study - CAMEO 2022 Evaluation")
+    print("🧬 MCTS Ablation Study - PDB_date Dataset Evaluation")
     print("=" * 60)
     
     # CLI: structure range + method switching
@@ -296,20 +305,20 @@ def main():
     end_idx = args.end
     print(f"🎯 Structure range: {start_idx}-{end_idx if end_idx is not None else 'end'} | Mode: {args.mode}")
     
-    # Load data using same pattern as test_mcts_with_real_data.py
-    loader = CAMEODataLoader()
+    # Load data using PDB loader
+    loader = PDBDataLoader()
     refs = load_correct_reference_sequences()
     
     # Initialize DPLM-2
-    dplm2 = DPLM2Integration(device="cuda")  # Use consolidated integration
+    dplm2 = CleanDPLM2Integration(model_name="airkingbd/dplm2_150m")  # Use 150M for single expert testing
     
     results = []
     
-    # Load structures using the same approach as our working test script
+    # Load structures using the PDB loader approach
     all_structures = []
-    struct_fasta_path = "/home/caom/AID3/dplm/data-bin/cameo2022/struct.fasta"
+    struct_fasta_path = "/home/caom/AID3/dplm/data-bin/PDB_date/struct.fasta"
     
-    # Load structure sequences directly from struct.fasta (same as test script)
+    # Load structure sequences directly from struct.fasta
     struct_records = {}
     if os.path.exists(struct_fasta_path):
         from Bio import SeqIO
@@ -320,25 +329,37 @@ def main():
         print(f"❌ struct.fasta not found: {struct_fasta_path}")
         return
     
-    # Create structures using the same format as our test script
+    # Create structures using the PDB loader format - only include structures with both sequence and structure data
+    valid_structures = []
     for idx, structure_file in enumerate(loader.structures):
-        # Get the base name (e.g., "7dz2_C" from "7dz2_C.pkl")
-        base_name = structure_file.replace('.pkl', '')
+        # Get the base name (e.g., "8A00" from "a0/8A00.pkl")
+        base_name = os.path.splitext(os.path.basename(structure_file))[0]
         
-        if base_name in struct_records:
-            # Create structure dict in the same format as our test script
+        # Check if we have both struct sequence and reference sequence
+        if base_name in struct_records and base_name in refs:
+            # Create structure dict in the PDB format
             struct_seq = struct_records[base_name]
             structure = {
                 'struct_seq': struct_seq,
                 'length': len(struct_seq.split(',')),
-                'pdb_id': base_name.split('_')[0] if '_' in base_name else base_name,
-                'chain_id': base_name.split('_')[1] if '_' in base_name else 'A',
-                'name': f"CAMEO {base_name}"
+                'pdb_id': base_name,
+                'chain_id': 'A',  # Default chain ID for PDB
+                'name': f"PDB {base_name}"
             }
-            all_structures.append((idx, structure))
-            print(f"✅ Created structure {idx}: {base_name} (length: {structure['length']})")
+            valid_structures.append((idx, structure))
+            if len(valid_structures) <= 10:  # Only print first 10 for brevity
+                print(f"✅ Created structure {len(valid_structures)-1}: {base_name} (length: {structure['length']})")
         else:
-            print(f"⚠️ No struct sequence found for {base_name}")
+            if idx < 10:  # Only print first 10 for brevity
+                missing = []
+                if base_name not in struct_records:
+                    missing.append("struct_seq")
+                if base_name not in refs:
+                    missing.append("ref_seq")
+                print(f"⚠️ Missing {', '.join(missing)} for {base_name}")
+    
+    all_structures = valid_structures
+    print(f"📊 Found {len(all_structures)} valid structures with both sequence and structure data")
     
     # Select structure range
     if end_idx is not None:
@@ -350,7 +371,7 @@ def main():
     
     # Method-by-method switching
     for idx, structure in test_structures:
-        name = f"CAMEO {structure.get('pdb_id','test')}_{structure.get('chain_id','A')}"
+        name = f"PDB {structure.get('pdb_id','test')}"
 
         if args.mode == "random_no_expert":
             r = run_one_structure(structure, name, dplm2, refs, ablation_mode="random_no_expert", structure_idx=idx, loader=loader)
@@ -382,10 +403,10 @@ def main():
         if r: results.append(r)
 
     # save grouped-by-mode summary for easier analysis
-    out_dir = "/net/scratch/caom/cameo_evaluation_results"
+    out_dir = "/net/scratch/caom/pdb_evaluation_results"
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_json = os.path.join(out_dir, f"mcts_ablation_results_{ts}.json")
+    out_json = os.path.join(out_dir, f"mcts_ablation_results_pdb_{ts}.json")
     with open(out_json, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n💾 Saved ablation results → {out_json}")
@@ -396,17 +417,17 @@ def main():
     for r in results:
         grouped[r["mode"]].append(r)
 
-    summary_path = os.path.join(out_dir, f"mcts_ablation_summary_{ts}.txt")
+    summary_path = os.path.join(out_dir, f"mcts_ablation_summary_pdb_{ts}.txt")
     try:
         with open(summary_path, "w") as sf:
-            sf.write("MCTS Ablation Summary (grouped by mode)\n")
+            sf.write("MCTS Ablation Summary - PDB_date Dataset (grouped by mode)\n")
             sf.write("="*80 + "\n\n")
             for mode, rows in grouped.items():
                 sf.write(f"Mode: {mode}\n")
                 sf.write("-"*80 + "\n")
                 sf.write(f"{'Structure':<20} {'Len':<5} {'Base AAR':<10} {'Final AAR':<10} {'ΔAAR':<8} {'Base R':<8} {'Final R':<8} {'ΔR':<8} {'Base scTM':<9} {'Final scTM':<10} {'ΔscTM':<8} {'Time(s)':<8}\n")
                 for r in rows:
-                    name = r['structure_name'].replace('CAMEO ', '')[:19]
+                    name = r['structure_name'].replace('PDB ', '')[:19]
                     sf.write(f"{name:<20} {r['length']:<5} {r['baseline_aar']:<10.3f} {r['final_aar']:<10.3f} "
                              f"{r['aar_improvement']:<8.3f} {r['baseline_reward']:<8.3f} {r['final_reward']:<8.3f} "
                              f"{r['reward_improvement']:<8.3f} {r['baseline_sctm']:<9.3f} {r['final_sctm']:<10.3f} "

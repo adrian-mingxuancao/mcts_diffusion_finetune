@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class CAMEODataLoader:
     """Loads CAMEO 2022 protein structures for MCTS testing."""
     
-    def __init__(self, data_path: str = "/net/scratch/caom/dplm_datasets/data-bin/cameo2022"):
+    def __init__(self, data_path: str = "/home/caom/AID3/dplm/data-bin/cameo2022"):
         """
         Initialize CAMEO data loader.
         

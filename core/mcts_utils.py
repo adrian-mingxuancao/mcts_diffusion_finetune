@@ -27,16 +27,26 @@ def compute_mask_schedule(sequence: str, plddt_scores: List[float], depth: int, 
     - Balanced exploration vs exploitation
     """
     # Progressive thresholds but not too aggressive
-    tau_start, tau_end = 0.80, 0.55  # Less aggressive decline
+    # Note: pLDDT scores are typically 0-100, so use appropriate thresholds
+    tau_start, tau_end = 80.0, 55.0  # Less aggressive decline
     progress = min(1.0, depth / max_depth) if max_depth > 0 else 0
     tau = tau_start - (tau_start - tau_end) * progress
     
     # Find low-confidence positions
-    low_confidence = [i for i, plddt in enumerate(plddt_scores) if plddt < tau]
+    # Handle both numpy arrays and lists
+    import numpy as np
+    if isinstance(plddt_scores, np.ndarray):
+        low_confidence = np.where(plddt_scores < tau)[0].tolist()
+    else:
+        low_confidence = [i for i, plddt in enumerate(plddt_scores) if plddt < tau]
     
     # Sort by confidence (lowest first) for prioritization
     if low_confidence:
-        scored_positions = [(i, plddt_scores[i]) for i in low_confidence]
+        # Handle numpy arrays properly
+        if isinstance(plddt_scores, np.ndarray):
+            scored_positions = [(i, float(plddt_scores[i])) for i in low_confidence]
+        else:
+            scored_positions = [(i, plddt_scores[i]) for i in low_confidence]
         scored_positions.sort(key=lambda x: x[1])  # Sort by pLDDT ascending
         mask = [pos for pos, _ in scored_positions]
     else:
@@ -62,8 +72,12 @@ def compute_mask_schedule(sequence: str, plddt_scores: List[float], depth: int, 
         mask = mask[:max_positions]
     elif len(mask) < min_positions:
         # Fallback: add random medium-confidence positions to ensure progress
-        medium_conf = [i for i, plddt in enumerate(plddt_scores) 
-                      if tau <= plddt < (tau + 0.15)]
+        if isinstance(plddt_scores, np.ndarray):
+            medium_conf_mask = (plddt_scores >= tau) & (plddt_scores < (tau + 15.0))
+            medium_conf = np.where(medium_conf_mask)[0].tolist()
+        else:
+            medium_conf = [i for i, plddt in enumerate(plddt_scores) 
+                          if tau <= plddt < (tau + 15.0)]
         if medium_conf:
             needed = min_positions - len(mask)
             additional = random.sample(medium_conf, min(needed, len(medium_conf)))
@@ -118,17 +132,30 @@ def compute_fast_aar(sequence: str, reference: str) -> float:
 def ph_uct_score(average_value: float, visit_count: int, parent_visits: int, 
                  c: float = 1.414, w_ent: float = 0.1, w_div: float = 0.1, 
                  entropy_proposals: float = 0.0, novelty_vs_parent: float = 0.0) -> float:
-    """PH-UCT score using parent visits and cached priors."""
+    """
+    PH-UCT score matching ERP paper formula:
+    Q + cp * p * log(N(st)) / (1 + N(st,a)) * π_τ(a|st) * (1/e) * Σ H(π_τ(·|st+i))
+    
+    The key difference from standard UCB is multiplication (*) instead of addition (+) 
+    for the entropy term, following the ERP paper's formulation.
+    """
     if visit_count == 0:
         return float('inf')
     
-    # Core UCB
-    ucb = average_value + c * math.sqrt(math.log(parent_visits + 1) / (visit_count + 1))
+    # Core UCB term: Q + c * sqrt(log(N(st)) / N(st,a))
+    ucb_exploration = c * math.sqrt(math.log(parent_visits + 1) / (visit_count + 1))
     
-    # PH terms (cached at expansion time)
-    ph_bonus = w_ent * entropy_proposals + w_div * novelty_vs_parent
+    # ERP paper formula: multiply exploration by entropy-weighted policy probability
+    # π_τ(a|st) * (1/e) * Σ H(π_τ(·|st+i)) approximated as entropy_proposals
+    entropy_factor = (1.0 / math.e) * entropy_proposals if entropy_proposals > 0 else 1.0
     
-    return ucb + ph_bonus
+    # Apply ERP multiplication: exploration term is scaled by entropy
+    ph_exploration = ucb_exploration * entropy_factor
+    
+    # Diversity bonus (novelty) is still additive
+    diversity_bonus = w_div * novelty_vs_parent
+    
+    return average_value + ph_exploration + diversity_bonus
 
 
 class SequenceCache:
