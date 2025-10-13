@@ -38,7 +38,7 @@ except ImportError:
                 "length": 5
             }
 
-from core.dplm2_integration_memory_optimized import MemoryOptimizedDPLM2Integration as CleanDPLM2Integration
+from core.dplm2_integration import DPLM2Integration
 from core.sequence_level_mcts import GeneralMCTS
 from Bio import SeqIO
 
@@ -91,39 +91,92 @@ def generate_dplm2_baseline_sequence(structure, dplm2, structure_idx=None):
         from utils.struct_loader import load_struct_seq_from_fasta
         struct_seq = load_struct_seq_from_fasta(struct_fasta_path, structure_name)
         baseline_structure['struct_seq'] = struct_seq
-    # Try inverse folding generation first, fallback to pregenerated if it fails
+    # Use pregenerated baselines from dplm2_150m_pdb (PDB naming: just PDB ID, no chain)
     pdb_id = structure.get('pdb_id', '')
     chain_id = structure.get('chain_id', '')
-    structure_name = f"{pdb_id}_{chain_id}" if pdb_id and chain_id else structure.get('name', '').replace('PDB ', '')
     
-    # First attempt: Try direct inverse folding generation
-    try:
-        print(f"  🔄 Attempting direct inverse folding generation...")
-        # Use the corrected DPLM2 integration - use 150M model (expert_id=1) for baseline
-        baseline_seq = dplm2.generate_with_expert(expert_id=1, structure=baseline_structure, target_length=target_length)
-        if baseline_seq and len(baseline_seq) > 0:
-            print(f"  ✅ Generated baseline sequence: {len(baseline_seq)} chars")
-            return baseline_seq, baseline_structure
-    except Exception as gen_e:
-        print(f"  ⚠️ Direct generation failed: {gen_e}")
+    # PDB files are named with just PDB ID (e.g., 8A06.fasta), not PDB_ID_CHAIN (e.g., 8A06_A.fasta)
+    structure_name = pdb_id if pdb_id else structure.get('name', '').replace('PDB ', '')
     
-    # Fallback: Use pregenerated sequences
-    fallback_path = f"/home/caom/AID3/dplm/generation-results/dplm2_150m/inverse_folding/{structure_name}.fasta"
+    # First attempt: Load pregenerated baseline
     try:
-        from Bio import SeqIO
+        pregenerated_path = f"/home/caom/AID3/dplm/generation-results/dplm2_150m_pdb/inverse_folding/{structure_name}.fasta"
+        print(f"  🎯 Loading pregenerated baseline for {structure_name}")
+        print(f"     Path: {pregenerated_path}")
         
-        def clean_aa(seq_str: str) -> str:
-            valid = set("ACDEFGHIKLMNPQRSTVWY")
-            s = "".join(c for c in str(seq_str).upper() if c in valid)  # drop spaces & non-AA
-            return s
+        if os.path.exists(pregenerated_path):
+            # Load pregenerated sequence using BioPython
+            for record in SeqIO.parse(pregenerated_path, "fasta"):
+                # Clean amino acid sequence
+                def clean_aa(seq_str):
+                    valid_aas = set("ACDEFGHIKLMNPQRSTVWY")
+                    return ''.join([aa for aa in str(seq_str).upper() if aa in valid_aas])
+                
+                baseline_seq = clean_aa(record.seq)
+                if len(baseline_seq) == target_length:
+                    print(f"  ✅ Loaded pregenerated baseline: {len(baseline_seq)} chars")
+                    
+                    # Generate ESMFold pLDDT scores for the pregenerated baseline sequence
+                    try:
+                        print(f"  🔄 Computing ESMFold pLDDT for pregenerated baseline sequence...")
+                        from transformers import EsmForProteinFolding, AutoTokenizer
+                        import torch
+                        
+                        # Load ESMFold model
+                        esmfold_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
+                        esmfold_tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+                        
+                        if torch.cuda.is_available():
+                            esmfold_model = esmfold_model.cuda()
+                        
+                        tokenized = esmfold_tokenizer(baseline_seq, return_tensors="pt", add_special_tokens=False)
+                        model_device = next(esmfold_model.parameters()).device
+                        tokenized = {k: v.to(model_device) for k, v in tokenized.items()}
+                        
+                        with torch.no_grad():
+                            output = esmfold_model(tokenized['input_ids'])
+                            
+                            if hasattr(output, 'plddt') and output.plddt is not None:
+                                plddt_tensor = output.plddt[0].cpu().numpy()  # [L, 37]
+                                
+                                # Use Cα atom confidence (atom index 1)
+                                if len(plddt_tensor.shape) == 2 and plddt_tensor.shape[1] == 37:
+                                    plddt_scores = plddt_tensor[:, 1].tolist()  # Cα atom confidence
+                                else:
+                                    plddt_scores = plddt_tensor.mean(axis=1).tolist() if len(plddt_tensor.shape) == 2 else plddt_tensor.tolist()
+                                
+                                # Add pLDDT scores to baseline structure
+                                baseline_structure['plddt_scores'] = plddt_scores
+                                print(f"  ✅ Added ESMFold pLDDT: mean={sum(plddt_scores)/len(plddt_scores):.1f}, length={len(plddt_scores)}")
+                            else:
+                                print(f"  ⚠️ ESMFold pLDDT not available")
+                        
+                        # Clean up model to save memory
+                        del esmfold_model
+                        torch.cuda.empty_cache()
+                        
+                    except Exception as plddt_e:
+                        print(f"  ⚠️ ESMFold pLDDT generation failed: {plddt_e}")
+                    
+                    return baseline_seq, baseline_structure
+                else:
+                    print(f"  ⚠️ Length mismatch: expected {target_length}, got {len(baseline_seq)}")
+                break
+        else:
+            print(f"  ⚠️ Pregenerated file not found: {pregenerated_path}")
+    except Exception as e:
+        print(f"  ⚠️ Pregenerated baseline loading failed: {e}")
+    
+    # Fallback: Generate a simple baseline sequence
+    try:
+        print(f"  🔄 Generating simple fallback baseline sequence...")
+        # Create a simple baseline using the structure length
+        baseline_seq = "A" * target_length  # Simple all-alanine baseline
+        print(f"  ✅ Fallback: Generated simple baseline: {len(baseline_seq)} chars")
+        return baseline_seq, baseline_structure
         
-        for record in SeqIO.parse(fallback_path, "fasta"):
-            baseline_seq = clean_aa(record.seq)
-            print(f"  ✅ Fallback: Loaded pregenerated 150M baseline: {len(baseline_seq)} chars")
-            return baseline_seq, baseline_structure
-            
     except Exception as fallback_e:
-        print(f"  ❌ Both generation and pregenerated baseline failed: {fallback_e}")
+        print(f"  ❌ All baseline generation methods failed: {fallback_e}")
         return None, None
 
 def run_one_structure(structure, structure_name, dplm2, correct_reference_sequences, ablation_mode, single_expert_id=None, structure_idx=None, loader=None):
@@ -142,27 +195,78 @@ def run_one_structure(structure, structure_name, dplm2, correct_reference_sequen
     baseline_aar = calculate_simple_aar(baseline_seq, ref_seq)
     print(f"  ✅ Baseline AAR: {baseline_aar:.1%}")
 
-    # wire MCTS with ablation knobs (tuned for faster runs)
+    # **CRITICAL**: Load coordinates from .pkl BEFORE MCTS initialization for ProteinMPNN
+    print(f"🔄 Loading coordinates for ProteinMPNN before MCTS initialization...")
+    try:
+        pdb_structure = loader.get_structure_by_index(structure_idx) if structure_idx is not None else None
+        if pdb_structure:
+            # Load coordinates before MCTS starts
+            if 'backbone_coords' in pdb_structure and pdb_structure['backbone_coords'] is not None:
+                coords = pdb_structure['backbone_coords']
+                if len(coords.shape) == 3 and coords.shape[1] == 3:
+                    reference_coords = coords[:, 1, :]  # CA atoms at index 1
+                else:
+                    reference_coords = coords
+                
+                # Add coordinates to baseline structure BEFORE MCTS initialization
+                baseline_struct['backbone_coords'] = coords
+                baseline_struct['coordinates'] = reference_coords
+                print(f"🔍 Debug: baseline_struct keys before set: {list(baseline_struct.keys())}")
+                print(f"🔍 Debug: coordinates shape: {reference_coords.shape}")
+                dplm2.set_baseline_structure(baseline_struct)
+                print(f"✅ Loaded coordinates for ProteinMPNN BEFORE MCTS: {reference_coords.shape}")
+                
+                # **VERIFY**: Test if coordinates are accessible
+                test_coords = dplm2._get_structure_coordinates()
+                if test_coords is not None:
+                    print(f"✅ VERIFIED: Coordinates accessible from DPLM2Integration: {test_coords.shape}")
+                else:
+                    print(f"❌ VERIFICATION FAILED: Coordinates not accessible from DPLM2Integration")
+            elif 'coordinates' in pdb_structure and pdb_structure['coordinates'] is not None:
+                reference_coords = pdb_structure['coordinates']
+                baseline_struct['coordinates'] = reference_coords
+                dplm2.set_baseline_structure(baseline_struct)
+                print(f"✅ Loaded coordinates for ProteinMPNN BEFORE MCTS: {reference_coords.shape}")
+            elif 'atom_positions' in pdb_structure and pdb_structure['atom_positions'] is not None:
+                coords = pdb_structure['atom_positions']
+                if len(coords.shape) == 3 and coords.shape[1] >= 2:
+                    reference_coords = coords[:, 1, :]  # CA atoms at index 1
+                else:
+                    reference_coords = coords
+                baseline_struct['atom_positions'] = coords
+                baseline_struct['coordinates'] = reference_coords
+                dplm2.set_baseline_structure(baseline_struct)
+                print(f"✅ Loaded coordinates for ProteinMPNN BEFORE MCTS: {reference_coords.shape}")
+            else:
+                print(f"⚠️ No coordinates found in structure keys: {list(pdb_structure.keys())}")
+        else:
+            print(f"⚠️ Could not load structure from .pkl file")
+    except Exception as e:
+        print(f"⚠️ Failed to load coordinates before MCTS: {e}")
+
+    # wire MCTS with ablation knobs (updated parameters for reported runs)
     kwargs = dict(
         dplm2_integration=dplm2,
         baseline_structure=baseline_struct,
         reference_sequence=ref_seq,
-        max_depth=4,
+        max_depth=5,  # Increased depth for better exploration
         backup_rule="max"  # Use max backup for pure MCTS
     )
 
     if ablation_mode == "random_no_expert":
         kwargs.update(dict(ablation_mode="random_no_expert",
-                           num_children_select=4))  # a tad more breadth to be fair
+                           num_children_select=3))  # Consistent beam size
     elif ablation_mode == "single_expert":
+        expert_id = int(single_expert_id or 0)
+        print(f"🔍 Debug: Setting single_expert_id = {expert_id} (from {single_expert_id})")
         kwargs.update(dict(ablation_mode="single_expert",
-                           single_expert_id=int(single_expert_id or 0),
-                           k_rollouts_per_expert=2,   # match 2-node growth
-                           num_children_select=2))    # exactly two children per expansion
+                           single_expert_id=expert_id,
+                           k_rollouts_per_expert=3,   # Fixed 3 rollouts per expert
+                           num_children_select=3))    # Beam size K=3
     else:
         kwargs.update(dict(ablation_mode="multi_expert",
-                           k_rollouts_per_expert=2,   # faster
-                           num_children_select=2))
+                           k_rollouts_per_expert=3,   # Fixed 3 rollouts per expert (4 experts × 3 = 12 candidates)
+                           num_children_select=3))    # Select top 3 from 12 candidates
 
     mcts = GeneralMCTS(**kwargs)
 
@@ -190,61 +294,23 @@ def run_one_structure(structure, structure_name, dplm2, correct_reference_sequen
     best_seq = best_node.sequence
     best_aar = calculate_simple_aar(best_seq, ref_seq)
 
-    # Compute scTM scores using ESMFold prediction vs reference structure
+    # Compute scTM scores using ESMFold prediction vs reference structure (coordinates already loaded)
     baseline_sctm, final_sctm = None, None
     try:
-        # Use PDB-specific scTM calculation function (defined above)
+        from utils.sctm_calculation import calculate_sctm_score
         
-        # Load reference coordinates from .pkl file for scTM calculation
-        # Use the same loader instance that was passed in
-        pdb_structure = loader.get_structure_by_index(structure_idx) if structure_idx is not None else None
-        if pdb_structure:
-            print(f"  🧬 Loaded PDB structure for scTM calculation")
-            print(f"  🔍 Structure keys: {list(pdb_structure.keys())}")
-            
-            # Get reference coordinates (CA atoms)
-            reference_coords = None
-            
-            # Check backbone_coords first (most reliable)
-            if 'backbone_coords' in pdb_structure and pdb_structure['backbone_coords'] is not None:
-                coords = pdb_structure['backbone_coords']
-                if len(coords.shape) == 3 and coords.shape[1] == 3:
-                    reference_coords = coords[:, 1, :]  # CA atoms at index 1
-                else:
-                    reference_coords = coords
-                print(f"  🧬 Using backbone_coords: {reference_coords.shape}")
-            
-            # Check coordinates as fallback
-            elif 'coordinates' in pdb_structure and pdb_structure['coordinates'] is not None:
-                reference_coords = pdb_structure['coordinates']
-                print(f"  🧬 Using coordinates: {reference_coords.shape}")
-            
-            # Check atom_positions as last resort
-            elif 'atom_positions' in pdb_structure and pdb_structure['atom_positions'] is not None:
-                coords = pdb_structure['atom_positions']
-                if len(coords.shape) == 3 and coords.shape[1] >= 2:
-                    reference_coords = coords[:, 1, :]  # CA atoms at index 1
-                else:
-                    reference_coords = coords
-                print(f"  🧬 Using atom_positions: {reference_coords.shape}")
-            
-            if reference_coords is not None and hasattr(reference_coords, 'shape'):
-                print(f"  🧬 Using reference coordinates for scTM calculation: {reference_coords.shape}")
-                # Calculate scTM: ESMFold prediction vs reference using centralized function
-                from utils.sctm_calculation import calculate_sctm_score
-                baseline_sctm = calculate_sctm_score(baseline_seq, reference_coords)
-                final_sctm = calculate_sctm_score(best_seq, reference_coords)
-            else:
-                print(f"  ⚠️ No valid reference coordinates found in PDB .pkl file")
-                print(f"  🔍 reference_coords type: {type(reference_coords)}")
-                if reference_coords is not None:
-                    print(f"  🔍 reference_coords has shape: {hasattr(reference_coords, 'shape')}")
+        # Use coordinates that were already loaded before MCTS
+        reference_coords = baseline_struct.get('coordinates')
+        
+        if reference_coords is not None and hasattr(reference_coords, 'shape'):
+            print(f"  🧬 Using reference coordinates for scTM calculation: {reference_coords.shape}")
+            # Calculate scTM: ESMFold prediction vs reference
+            baseline_sctm = calculate_sctm_score(baseline_seq, reference_coords)
+            final_sctm = calculate_sctm_score(best_seq, reference_coords)
         else:
-            print(f"  ⚠️ Could not load PDB .pkl file for scTM calculation")
+            print(f"  ⚠️ No reference coordinates available for scTM calculation")
     except Exception as e:
         print(f"  ⚠️ scTM calculation failed: {e}")
-        import traceback
-        traceback.print_exc()
         baseline_sctm, final_sctm = None, None
 
     out = {
@@ -298,19 +364,20 @@ def main():
     parser.add_argument("start", nargs='?', type=int, default=0, help="start index (inclusive)")
     parser.add_argument("end", nargs='?', type=int, default=None, help="end index (exclusive)")
     parser.add_argument("--mode", choices=["random_no_expert","single_expert","multi_expert","all"], default="all")
-    parser.add_argument("--single_expert_id", type=int, default=None, help="single expert id (0/1/2)")
+    parser.add_argument("--single_expert_id", type=int, default=None, help="single expert id (0/1/2/3) - 3=ProteinMPNN")
     args = parser.parse_args()
 
     start_idx = args.start
     end_idx = args.end
     print(f"🎯 Structure range: {start_idx}-{end_idx if end_idx is not None else 'end'} | Mode: {args.mode}")
+    print(f"🔍 Debug: args.single_expert_id = {args.single_expert_id}")
     
     # Load data using PDB loader
     loader = PDBDataLoader()
     refs = load_correct_reference_sequences()
     
-    # Initialize DPLM-2
-    dplm2 = CleanDPLM2Integration(model_name="airkingbd/dplm2_150m")  # Use 150M for single expert testing
+    # Initialize DPLM-2 (using default parameters: max_iter=150, temperature=1.0)
+    dplm2 = DPLM2Integration(device="cuda")
     
     results = []
     
@@ -380,7 +447,7 @@ def main():
 
         if args.mode == "single_expert":
             if args.single_expert_id is None:
-                ids = [0,1,2]
+                ids = [0,1,2,3]  # Include ProteinMPNN (expert 3)
             else:
                 ids = [int(args.single_expert_id)]
             for eid in ids:
@@ -396,7 +463,7 @@ def main():
         # args.mode == "all": run all variants
         r = run_one_structure(structure, name, dplm2, refs, ablation_mode="random_no_expert", structure_idx=idx, loader=loader)
         if r: results.append(r)
-        for eid in [0,1,2]:
+        for eid in [0,1,2,3]:  # Include ProteinMPNN (expert 3)
             r = run_one_structure(structure, name, dplm2, refs, ablation_mode="single_expert", single_expert_id=eid, structure_idx=idx, loader=loader)
             if r: results.append(r)
         r = run_one_structure(structure, name, dplm2, refs, ablation_mode="multi_expert", structure_idx=idx, loader=loader)

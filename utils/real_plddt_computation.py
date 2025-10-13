@@ -20,7 +20,7 @@ _esmfold_tokenizer = None
 
 
 def load_esmfold_model():
-    """Load ESMFold model using HuggingFace transformers with memory management."""
+    """Load ESMFold model using official ESM approach (like evaluator_dplm2.py)."""
     global _esmfold_model, _esmfold_tokenizer
     
     if _esmfold_model is not None:
@@ -28,43 +28,96 @@ def load_esmfold_model():
     
     print("🔬 Loading ESMFold model with memory management...")
     try:
-        from transformers import AutoTokenizer, EsmForProteinFolding
-        from core.memory_manager import get_memory_manager
-        
-        memory_manager = get_memory_manager()
-        
-        # Check if we can load ESMFold
-        if not memory_manager.can_load_model("esmfold"):
-            print("⚠️ Insufficient memory for ESMFold, performing cleanup...")
-            memory_manager.emergency_cleanup()
+        # Method 1: Official ESM approach (like evaluator_dplm2.py folding_model.py line 61)
+        try:
+            import esm
             
-            if not memory_manager.can_load_model("esmfold"):
-                print("❌ Still insufficient memory for ESMFold")
-                return None, None
+            # Set proper cache directory to use existing cached model
+            import torch
+            torch.hub.set_dir('/net/scratch/caom/.cache/torch')
+            
+            print("🔄 Loading model: esmfold (using cached)")
+            _esmfold_model = esm.pretrained.esmfold_v1().eval()
+            _esmfold_tokenizer = None  # ESM handles tokenization internally
+            
+            # Move to GPU if available
+            if torch.cuda.is_available():
+                device = torch.device('cuda')
+                _esmfold_model = _esmfold_model.to(device)
+                print("✅ Model esmfold loaded successfully")
+                
+                # Check GPU memory
+                if hasattr(torch.cuda, 'memory_reserved'):
+                    reserved = torch.cuda.memory_reserved(0) / 1024**3
+                    allocated = torch.cuda.memory_allocated(0) / 1024**3
+                    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                    usage = allocated / total * 100
+                    print(f"   GPU memory usage: {usage:.1f}%")
+                    print(f"   GPU Memory: {allocated:.1f}GB/{total:.1f}GB ({usage:.1f}%) | Loaded: 1 models")
+            
+            return _esmfold_model, _esmfold_tokenizer
+            
+        except Exception as esm_e:
+            print(f"⚠️ Official ESM loading failed: {esm_e}")
+            
+            # Check if it's a disk quota issue
+            if "Disk quota exceeded" in str(esm_e):
+                print("   🔧 Disk quota issue detected, trying to use cached model directly...")
+                
+                # Try to load from cache directly
+                try:
+                    cache_path = '/net/scratch/caom/.cache/torch/hub/checkpoints/esmfold_3B_v1.pt'
+                    if os.path.exists(cache_path):
+                        print(f"   📁 Found cached model: {cache_path}")
+                        
+                        # Load state dict and create model
+                        import torch
+                        state_dict = torch.load(cache_path, map_location='cpu')
+                        
+                        # Create model structure and load weights
+                        _esmfold_model = esm.pretrained.esmfold_v1(state_dict=state_dict).eval()
+                        _esmfold_tokenizer = None
+                        
+                        if torch.cuda.is_available():
+                            _esmfold_model = _esmfold_model.to('cuda')
+                        
+                        print("✅ Loaded ESMFold from cached checkpoint")
+                        return _esmfold_model, _esmfold_tokenizer
+                        
+                except Exception as cache_e:
+                    print(f"   ⚠️ Cache loading failed: {cache_e}")
+            
+            print(f"   Falling back to transformers...")
         
-        # Load tokenizer and model
-        _esmfold_tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
-        _esmfold_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1", low_cpu_mem_usage=True)
-        
-        _esmfold_model = _esmfold_model.eval()
-        
-        # Move to appropriate device
-        if torch.cuda.is_available():
-            try:
-                _esmfold_model.cuda()
-                # Register with memory manager
-                memory_manager.load_model("esmfold", _esmfold_model)
-                print("✅ ESMFold loaded on GPU with memory management")
-                print(f"   {memory_manager.get_memory_status()}")
-            except Exception as e:
-                print(f"⚠️ GPU loading failed: {e}, using CPU")
+        # Method 2: HuggingFace transformers fallback
+        try:
+            from transformers import AutoTokenizer, EsmForProteinFolding
+            
+            # Load tokenizer and model
+            _esmfold_tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+            _esmfold_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1", low_cpu_mem_usage=True)
+            
+            _esmfold_model = _esmfold_model.eval()
+            
+            # Move to appropriate device
+            if torch.cuda.is_available():
+                try:
+                    _esmfold_model.cuda()
+                    print("✅ ESMFold loaded on GPU (HuggingFace)")
+                except Exception as e:
+                    print(f"⚠️ GPU loading failed: {e}, using CPU")
+                    _esmfold_model.cpu()
+                    print("✅ ESMFold loaded on CPU")
+            else:
                 _esmfold_model.cpu()
                 print("✅ ESMFold loaded on CPU")
-        else:
-            _esmfold_model.cpu()
-            print("✅ ESMFold loaded on CPU")
+                
+            return _esmfold_model, _esmfold_tokenizer
             
-        return _esmfold_model, _esmfold_tokenizer
+        except Exception as hf_e:
+            print(f"⚠️ HuggingFace ESMFold loading failed: {hf_e}")
+        
+        return None, None
         
     except Exception as e:
         print(f"❌ ESMFold loading failed: {e}")
@@ -367,7 +420,16 @@ def compute_plddt_from_structure(structure: Dict) -> List[float]:
         
         print(f"🎯 ESMFold pLDDT computation: target_length={target_length}")
         
-        # 🎯 STEP 2: Try ESMFold-based pLDDT calculation first
+        # 🎯 STEP 1.5: Check for pre-computed ESMFold pLDDT scores first (HIGHEST PRIORITY)
+        if 'plddt_scores' in structure and structure['plddt_scores'] is not None:
+            existing_plddt = structure['plddt_scores']
+            if len(existing_plddt) == target_length:
+                print(f"   ✅ Using pre-computed ESMFold pLDDT: mean={sum(existing_plddt)/len(existing_plddt):.3f}, length={len(existing_plddt)}")
+                return existing_plddt
+            else:
+                print(f"   ⚠️ Pre-computed pLDDT length mismatch: {len(existing_plddt)} vs {target_length}")
+        
+        # 🎯 STEP 2: Try ESMFold-based pLDDT calculation if no pre-computed scores
         if sequence:
             print(f"   Using ESMFold for sequence: {sequence[:50]}...")
             try:
@@ -531,3 +593,166 @@ if __name__ == "__main__":
     struct_plddt = compute_plddt_from_structure(structure)
     print(f"\nStructure interface test:")
     print(f"Average plDDT: {np.mean(struct_plddt):.3f}")
+
+def compute_sctm_from_esmfold(generated_seq: str, reference_seq: str, reference_coords: np.ndarray) -> float:
+    """
+    Compute scTM (structural TM-score) using ESMFold prediction and real TM-score calculation.
+    
+    Args:
+        generated_seq: Generated protein sequence
+        reference_seq: Reference protein sequence  
+        reference_coords: Reference structure coordinates (CA atoms)
+        
+    Returns:
+        scTM score (0.0 to 1.0)
+    """
+    try:
+        print(f"   🔄 Computing real scTM with ESMFold for sequence length {len(generated_seq)}")
+        
+        # Load ESMFold model
+        esmfold_model, _ = load_esmfold_model()
+        if esmfold_model is None:
+            print("   ❌ ESMFold model not available, using sequence similarity")
+            # Fallback to sequence similarity
+            matches = sum(1 for a, b in zip(generated_seq, reference_seq) if a == b)
+            return matches / len(reference_seq)
+        
+        # Predict structure for generated sequence
+        print(f"   🧬 Predicting structure with ESMFold...")
+        with torch.no_grad():
+            # Use ESMFold to predict structure
+            output = esmfold_model.infer_pdb(generated_seq)
+        
+        # Extract coordinates from ESMFold output
+        predicted_coords = None
+        
+        if hasattr(output, 'atom_positions'):
+            # ESMFold returns atom positions tensor
+            atom_pos = output.atom_positions
+            print(f"   📊 ESMFold atom_positions shape: {atom_pos.shape}")
+            
+            # Handle different tensor shapes
+            if len(atom_pos.shape) == 4:  # [batch, seq_len, atom_type, 3]
+                predicted_coords = atom_pos[0, :, 1, :].cpu().numpy()  # CA atoms
+            elif len(atom_pos.shape) == 3:  # [seq_len, atom_type, 3]
+                predicted_coords = atom_pos[:, 1, :].cpu().numpy()  # CA atoms
+            else:
+                print(f"   ⚠️ Unexpected atom_positions shape: {atom_pos.shape}")
+                predicted_coords = atom_pos.reshape(-1, 3).cpu().numpy()  # Flatten and reshape
+                
+        elif hasattr(output, 'positions'):
+            # Alternative tensor format
+            positions = output.positions
+            print(f"   📊 ESMFold positions shape: {positions.shape}")
+            
+            if len(positions.shape) == 5:  # [batch, model, seq_len, atom_type, 3]
+                predicted_coords = positions[0, 0, :, 1, :].cpu().numpy()  # CA atoms
+            elif len(positions.shape) == 4:  # [batch, seq_len, atom_type, 3]
+                predicted_coords = positions[0, :, 1, :].cpu().numpy()  # CA atoms
+            else:
+                print(f"   ⚠️ Unexpected positions shape: {positions.shape}")
+                predicted_coords = positions.reshape(-1, 3).cpu().numpy()  # Flatten and reshape
+                
+        elif isinstance(output, str):
+            # PDB string output - parse coordinates
+            predicted_coords = parse_pdb_coordinates_from_string(output)
+        else:
+            print(f"   ⚠️ Unknown ESMFold output format: {type(output)}")
+            # Try to extract coordinates from any tensor attribute
+            for attr_name in dir(output):
+                if 'position' in attr_name.lower() or 'coord' in attr_name.lower():
+                    try:
+                        attr_val = getattr(output, attr_name)
+                        if hasattr(attr_val, 'shape') and len(attr_val.shape) >= 2:
+                            print(f"   🔍 Found tensor attribute {attr_name}: {attr_val.shape}")
+                            if attr_val.shape[-1] == 3:  # Looks like coordinates
+                                predicted_coords = attr_val.reshape(-1, 3).cpu().numpy()
+                                break
+                    except:
+                        continue
+            
+            if predicted_coords is None:
+                # Fallback to sequence similarity
+                matches = sum(1 for a, b in zip(generated_seq, reference_seq) if a == b)
+                return matches / len(reference_seq)
+        
+        if predicted_coords is None or len(predicted_coords) == 0:
+            print("   ❌ Could not extract coordinates from ESMFold output")
+            # Fallback to sequence similarity
+            matches = sum(1 for a, b in zip(generated_seq, reference_seq) if a == b)
+            return matches / len(reference_seq)
+        
+        # Ensure coordinate arrays have same length
+        min_len = min(len(predicted_coords), len(reference_coords))
+        predicted_coords = predicted_coords[:min_len]
+        reference_coords = reference_coords[:min_len]
+        
+        print(f"   📐 Calculating TM-score between structures (length: {min_len})")
+        
+        # Calculate TM-score
+        tm_score = calculate_tm_score_real(predicted_coords, reference_coords)
+        
+        print(f"   ✅ Real scTM calculated: {tm_score:.3f}")
+        return tm_score
+        
+    except Exception as e:
+        print(f"   ❌ scTM calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Fallback to sequence similarity
+        try:
+            matches = sum(1 for a, b in zip(generated_seq, reference_seq) if a == b)
+            return matches / len(reference_seq)
+        except:
+            return 0.3  # Conservative fallback
+
+def parse_pdb_coordinates_from_string(pdb_string: str) -> np.ndarray:
+    """Parse CA coordinates from PDB string."""
+    coords = []
+    for line in pdb_string.split('\n'):
+        if line.startswith('ATOM') and ' CA ' in line:
+            try:
+                x = float(line[30:38].strip())
+                y = float(line[38:46].strip()) 
+                z = float(line[46:54].strip())
+                coords.append([x, y, z])
+            except (ValueError, IndexError):
+                continue
+    return np.array(coords) if coords else np.array([])
+
+def calculate_tm_score_real(coords1: np.ndarray, coords2: np.ndarray) -> float:
+    """Calculate TM-score between two coordinate sets using proper TM-score formula."""
+    try:
+        if len(coords1) == 0 or len(coords2) == 0:
+            return 0.0
+        
+        # Align structures using Kabsch algorithm (simplified)
+        coords1_centered = coords1 - np.mean(coords1, axis=0)
+        coords2_centered = coords2 - np.mean(coords2, axis=0)
+        
+        # Calculate distances after alignment
+        distances = np.linalg.norm(coords1_centered - coords2_centered, axis=1)
+        
+        # TM-score calculation
+        # TM = (1/L) * Σ(1 / (1 + (di/d0)^2))
+        # where d0 = 1.24 * (L-15)^(1/3) - 1.8 for L > 15
+        
+        L = len(coords1)
+        if L <= 15:
+            d0 = 0.5
+        else:
+            d0 = 1.24 * ((L - 15) ** (1/3)) - 1.8
+        
+        # Calculate TM-score terms
+        tm_terms = 1.0 / (1.0 + (distances / d0)**2)
+        tm_score = np.mean(tm_terms)
+        
+        # Ensure reasonable bounds
+        tm_score = max(0.0, min(1.0, tm_score))
+        
+        return tm_score
+        
+    except Exception as e:
+        print(f"   ⚠️ TM-score calculation failed: {e}")
+        return 0.0

@@ -149,6 +149,27 @@ def predict_structure_with_esmfold(sequence: str) -> Optional[np.ndarray]:
         
         print(f"🔧 Extracted CA coordinates shape: {ca_coords.shape}")
         
+        # Extract pLDDT scores from ESMFold output
+        plddt_scores = None
+        if 'plddt' in output:
+            plddt_raw = output['plddt'].cpu().numpy()
+            print(f"🔧 ESMFold pLDDT shape: {plddt_raw.shape}, range: {plddt_raw.min():.3f}-{plddt_raw.max():.3f}")
+            
+            # Handle batch dimensions and extract per-residue confidence
+            if plddt_raw.ndim > 1:
+                plddt_scores = plddt_raw.flatten()[:len(sequence)]
+            else:
+                plddt_scores = plddt_raw[:len(sequence)]
+                
+            # ESMFold pLDDT is typically 0-100 already, but check scale
+            if plddt_scores.max() <= 1.0:
+                plddt_scores = plddt_scores * 100.0  # Convert 0-1 to 0-100
+                print(f"🔧 Converted ESMFold pLDDT from 0-1 to 0-100 scale")
+            
+            print(f"✅ ESMFold pLDDT extracted: mean={plddt_scores.mean():.1f}, range={plddt_scores.min():.1f}-{plddt_scores.max():.1f}")
+        else:
+            print("⚠️ No pLDDT scores in ESMFold output")
+        
         # Validate coordinate extraction
         if len(ca_coords) != len(sequence):
             print(f"⚠️ Coordinate length mismatch: got {len(ca_coords)}, expected {len(sequence)}")
@@ -168,23 +189,22 @@ def predict_structure_with_esmfold(sequence: str) -> Optional[np.ndarray]:
                 ca_coords = ca_coords[:len(sequence)]
         
         print(f"🔧 Final CA coordinates shape: {ca_coords.shape}")
-        
-        return ca_coords
+        return ca_coords, plddt_scores
         
     except Exception as e:
-        print(f"⚠️ ESMFold prediction failed: {e}")
-        return None
+        print(f"❌ ESMFold prediction failed: {e}")
+        return None, None
 
-def generate_baseline_structure(sequence: str, dplm2: DPLM2Integration, structure_idx: int = None) -> Optional[np.ndarray]:
+def generate_baseline_structure(sequence: str, dplm2: DPLM2Integration, structure_idx: int = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """Generate baseline structure using ESMFold (consistent baseline for comparison)"""
     try:
         print(f"🎯 Generating ESMFold baseline structure for sequence length {len(sequence)}")
         
         # Use ESMFold as primary baseline for consistent comparison
-        baseline_coords = predict_structure_with_esmfold(sequence)
+        baseline_coords, baseline_plddt = predict_structure_with_esmfold(sequence)
         if baseline_coords is not None:
             print(f"✅ ESMFold baseline generation successful: {baseline_coords.shape}")
-            return baseline_coords
+            return baseline_coords, baseline_plddt
         
         # Fallback to DPLM-2 if ESMFold fails
         print(f"🔄 ESMFold failed, trying DPLM-2 150M as fallback...")
@@ -197,17 +217,17 @@ def generate_baseline_structure(sequence: str, dplm2: DPLM2Integration, structur
             
             if structure_coords is not None:
                 print(f"✅ DPLM-2 fallback structure generation successful")
-                return structure_coords
+                return structure_coords, None  # No pLDDT from DPLM-2 fallback
                 
         except Exception as dplm2_e:
             print(f"⚠️ DPLM-2 fallback also failed: {dplm2_e}")
         
         print(f"❌ All baseline structure generation methods failed")
-        return None
+        return None, None
         
     except Exception as e:
         print(f"❌ Baseline structure generation failed: {e}")
-        return None
+        return None, None
 
 def run_folding_ablation(sequence: str, structure_name: str, reference_coords: np.ndarray,
                         dplm2: DPLM2Integration, ablation_mode: str, single_expert_id: int = None,
@@ -232,7 +252,7 @@ def run_folding_ablation(sequence: str, structure_name: str, reference_coords: n
     print(f"  🎯 Task: Folding optimization")
     
     # Generate baseline structure
-    baseline_coords = generate_baseline_structure(sequence, dplm2, structure_idx)
+    baseline_coords, baseline_plddt = generate_baseline_structure(sequence, dplm2, structure_idx)
     if baseline_coords is None:
         print("  ❌ Baseline structure generation failed")
         return None
@@ -252,32 +272,53 @@ def run_folding_ablation(sequence: str, structure_name: str, reference_coords: n
         # Fallback to dummy structure tokens
         struct_seq_str = ','.join(['159'] * len(sequence))
     
-    # Convert ESMFold coordinates to DPLM structure tokens for proper MCTS integration
+    # Convert ESMFold coordinates to REAL DPLM structure tokens for baseline
     converted_struct_tokens = None
     if baseline_coords is not None:
         try:
-            # Create a temporary MCTS instance to access coordinate conversion
-            from core.sequence_level_mcts import GeneralMCTS
-            temp_mcts = GeneralMCTS(
-                dplm2_integration=dplm2,
-                reference_sequence=sequence,
-                baseline_structure={'sequence': sequence, 'coordinates': baseline_coords},
-                task_type="folding"
-            )
-            converted_struct_tokens = temp_mcts._coords_to_structure_tokens(baseline_coords)
-            if converted_struct_tokens:
-                print(f"  🔧 Converted ESMFold coordinates to DPLM structure tokens")
-                struct_seq_str = converted_struct_tokens  # Use converted tokens instead of FASTA
+            from byprot.models.utils import get_struct_tokenizer
+            import torch
+            
+            print(f"  🔄 Converting ESMFold coordinates to REAL structure tokens...")
+            struct_tokenizer = get_struct_tokenizer()
+            
+            # Convert CA coordinates to full atom37 format
+            seq_len = len(sequence)
+            full_coords = torch.zeros((1, seq_len, 37, 3), dtype=torch.float32)
+            coords_tensor = torch.from_numpy(baseline_coords).float()
+            
+            # Place CA coordinates at atom index 1 (standard CA position)
+            full_coords[0, :, 1, :] = coords_tensor
+            
+            # Create residue mask (all positions valid)
+            res_mask = torch.ones((1, seq_len), dtype=torch.float32)  # Use float32, not bool
+            
+            # Create seq_length tensor (required by tokenizer)
+            seq_length = torch.tensor([seq_len], dtype=torch.long)
+            
+            # Tokenize coordinates to get REAL structure tokens
+            struct_tokens = struct_tokenizer.tokenize(full_coords, res_mask, seq_length)
+            
+            if struct_tokens is not None and isinstance(struct_tokens, torch.Tensor):
+                struct_tokens = struct_tokens.squeeze(0)  # Remove batch dim
+                token_list = [str(int(token.item())) for token in struct_tokens]
+                struct_seq_str = ','.join(token_list)
+                print(f"  ✅ Generated REAL baseline structure tokens: {len(token_list)} tokens")
             else:
-                print(f"  ⚠️ Coordinate conversion failed, using FASTA tokens")
+                print(f"  ⚠️ Structure tokenizer returned None, using mask tokens")
+                struct_seq_str = ','.join(['<mask_struct>'] * seq_len)
+                struct_seq_str = f"<cls_struct>,{struct_seq_str},<eos_struct>"
+                
         except Exception as e:
-            print(f"  ⚠️ Coordinate conversion error: {e}, using FASTA tokens")
+            print(f"  ⚠️ Structure tokenization failed: {e}, using mask tokens")
+            struct_seq_str = ','.join(['<mask_struct>'] * len(sequence))
+            struct_seq_str = f"<cls_struct>,{struct_seq_str},<eos_struct>"
     
     baseline_structure = {
         'sequence': sequence,
         'coordinates': baseline_coords,
         'length': len(sequence),
-        'plddt_scores': None,  # Let MCTS use dynamic pLDDT from generated structures
+        'plddt_scores': baseline_plddt,  # Use ESMFold pLDDT for initial masking
         'structure_idx': structure_idx,
         'struct_seq': struct_seq_str,  # Use converted tokens or FASTA fallback
         'name': structure_name,  # Add name for fallback loading
@@ -328,8 +369,9 @@ def run_folding_ablation(sequence: str, structure_name: str, reference_coords: n
             print(f"  ⚠️ Baseline reward computation failed: {e}")
         
         # Run MCTS search
+        num_iterations = 25
         start_time = time.time()
-        root_node = mcts.search(initial_sequence=sequence, num_iterations=25)
+        root_node = mcts.search(initial_sequence=sequence, num_iterations=num_iterations)
         search_time = time.time() - start_time
         
         # Find best node in tree
@@ -354,7 +396,7 @@ def run_folding_ablation(sequence: str, structure_name: str, reference_coords: n
         else:
             print(f"  ⚠️ Best node missing stored results, regenerating structure...")
             # Generate final structure for best sequence using ESMFold for consistency
-            final_coords = predict_structure_with_esmfold(best_sequence)
+            final_coords, _ = predict_structure_with_esmfold(best_sequence)
             if final_coords is None:
                 print(f"  ❌ Final structure prediction failed")
                 return None
@@ -369,34 +411,38 @@ def run_folding_ablation(sequence: str, structure_name: str, reference_coords: n
         tmscore_improvement = final_tmscore - baseline_tmscore  # Higher TM-score is better
         structure_improved = rmsd_improvement > 0 or tmscore_improvement > 0
         
-        # Results summary
+        # Store results (convert numpy types to Python types for JSON serialization)
         result = {
-            "structure_name": structure_name,
-            "sequence_length": len(sequence),
-            "mode": ablation_mode if single_expert_id is None else f"{ablation_mode}_{single_expert_id}",
-            "baseline_rmsd": baseline_rmsd,
-            "final_rmsd": final_rmsd,
-            "rmsd_improvement": rmsd_improvement,
-            "baseline_tmscore": baseline_tmscore,
-            "final_tmscore": final_tmscore,
-            "tmscore_improvement": tmscore_improvement,
-            "baseline_reward": baseline_reward,
-            "final_reward": best_reward,
-            "reward_improvement": best_reward - baseline_reward,
-            "structure_improved": structure_improved,
-            "baseline_sequence": sequence,
-            "final_sequence": best_sequence,
-            "search_time": search_time,
-            "mcts_success": True
+            'structure_name': structure_name,
+            'sequence_length': len(sequence),
+            'ablation_mode': ablation_mode,
+            'single_expert_id': single_expert_id,
+            'baseline_rmsd': float(baseline_rmsd),
+            'baseline_tmscore': float(baseline_tmscore),
+            'baseline_reward': float(baseline_reward),
+            'final_rmsd': float(final_rmsd),
+            'final_tmscore': float(final_tmscore),
+            'final_reward': float(best_reward),
+            'rmsd_improvement': float(rmsd_improvement),
+            'tmscore_improvement': float(tmscore_improvement),
+            'reward_improvement': float(best_reward - baseline_reward),
+            'improved': bool(rmsd_improvement > 0),  # Convert numpy bool_ to Python bool
+            'search_time': float(search_time),
+            'total_time': float(time.time() - start_time),
+            'num_iterations': int(num_iterations),
+            'best_depth': int(getattr(best_node, "depth", 0)),
+            'tree_size': int(len([n for n in [root_node] + getattr(root_node, 'children', []) if hasattr(n, 'sequence')]))
         }
         
-        # Print per-structure summary
         print("  ─────────────────────────────────────────────────────────")
         print(f"  Summary [{ablation_mode}{'' if single_expert_id is None else f'/{single_expert_id}'}] {structure_name}")
         print(f"    RMSD    : {baseline_rmsd:.3f}Å → {final_rmsd:.3f}Å (Δ {rmsd_improvement:+.3f}Å)")
         print(f"    TM-score: {baseline_tmscore:.3f} → {final_tmscore:.3f} (Δ {tmscore_improvement:+.3f})")
         print(f"    Reward  : {baseline_reward:.3f} → {best_reward:.3f} (Δ {best_reward - baseline_reward:+.3f})")
         print(f"    Improved: {structure_improved}")
+        
+        # Add structure_improved to result for summary
+        result['structure_improved'] = bool(structure_improved)
         print(f"    Time    : {search_time:.1f}s")
         print("  ─────────────────────────────────────────────────────────")
         
@@ -556,7 +602,7 @@ def main():
     from collections import defaultdict
     grouped = defaultdict(list)
     for r in results:
-        grouped[r["mode"]].append(r)
+        grouped[r["ablation_mode"]].append(r)
     
     summary_file = os.path.join(output_dir, f"mcts_folding_ablation_summary_{timestamp}.txt")
     try:

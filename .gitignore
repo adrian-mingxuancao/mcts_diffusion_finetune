@@ -94,3 +94,6 @@ logs/
 debug_tokenization.py
 visualization/
 scripts/
+tests/gitig
+debugs/
+openfold/

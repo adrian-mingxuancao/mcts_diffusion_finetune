@@ -4,30 +4,28 @@ A general framework for improving Diffusion-based Protein Language Model (DPLM-2
 
 ## 🎯 **Project Overview**
 
-This framework provides a **task-agnostic approach** to improve DPLM-2 performance across all protein modeling tasks:
+This project provides a **task-agnostic MCTS layer** on top of DPLM-2 that we use for the paper experiments across:
 
 - **Inverse Folding** (structure → sequence)
-- **Folding** (sequence → structure) 
-- **Unconditional Generation**
-- **Conditional Generation**
+- **Forward Folding** (sequence → structure)
+- **Motif Scaffolding** (motif-conditioned design)
+- **Unconditional / Conditional Generation** (used for ablations)
 
 ### 🚀 **Key Innovations**
 
-1. **plDDT-based Masking**: Intelligent masking based on predicted local distance difference test scores (with random fallback)
-2. **Simultaneous Position Sampling**: Leverages diffusion's ability to sample multiple positions at once (unlike transformers)
-3. **Expert Rollout**: Uses compound rewards to guide exploration toward better solutions
-4. **Task-Agnostic Design**: Same framework works for all DPLM-2 tasks
+1. **plDDT-aware masking** that targets low-confidence regions while backing off to random masking when needed.
+2. **Simultaneous diffusion sampling** so multiple residues can be regenerated in one rollout.
+3. **Multi-expert reward shaping** that combines DPLM-2, ProteinMPNN, and external motif experts under a unified score.
+4. **UCT + Sampling planners** that we can swap per task (see the updated experiment suite below).
 
-### 🧠 **Core Concept**
-
-The framework uses MCTS to explore sequence space more efficiently than standard generation:
+### 🧠 **Core Loop**
 
 ```
-1. Mask sequence based on plDDT (or randomly)
-2. Sample multiple positions simultaneously using diffusion
-3. Evaluate with compound rewards (structure + biophysical + naturalness, expert rollout would be included in the future)
-4. Use expert rollout to guide exploration
-5. Backpropagate rewards to improve future decisions
+1. Select a frontier node with PH-UCT (entropy + novelty bonuses)
+2. Mask residues using pLDDT guidance and task-specific heuristics
+3. Roll out candidates via DPLM-2 (and optional external experts)
+4. Score with compound rewards (TM, RMSD, biophysics, motif preservation)
+5. Backpropagate rewards and repeat
 ```
 
 ## 🏗️ **Framework Structure**
@@ -35,68 +33,56 @@ The framework uses MCTS to explore sequence space more efficiently than standard
 ```
 mcts_diffusion_finetune/
 ├── core/
-│   ├── sequence_level_mcts.py    # General MCTS framework
-│   ├── dplm2_integration.py     # DPLM-2 model integration
-│   └── __init__.py
+│   ├── sequence_level_mcts.py              # General sequence MCTS planner
+│   ├── folding_mcts.py                     # Folding-specific orchestration
+│   ├── motif_scaffolding_mcts.py           # Motif scaffolding search
+│   ├── external_models/                    # Integrations (ProteinMPNN, RFdiffusion, etc.)
+│   └── archive/                            # Historical variants kept for reference
 ├── utils/
-│   ├── reward_computation.py     # Compound reward functions
-│   ├── protein_utils.py         # Protein utilities
-│   └── plddt_computation.py    # plDDT scoring
-├── examples/
-│   ├── demo_mcts_simulations.py # MCTS concept demonstration
-│   └── detailed_simulations.py  # Performance analysis
-├── test_general_mcts.py         # Test all task types
-└── README.md
+│   ├── structure_converter.py              # Token ↔ coordinate helpers
+│   ├── cameo_data_loader.py                # CAMEO dataset utilities
+│   ├── pdb_data_loader.py                  # PDB_Date dataset helpers
+│   └── reward_computation.py               # Composite reward functions
+├── tests/
+│   ├── uct_mcts_folding.py                 # Folding UCT campaign runner
+│   ├── uct_sampling_folding.py             # Folding sampling baseline
+│   ├── uct_mcts_inverse_folding.py         # Inverse folding UCT runner
+│   ├── inverse_folding_sampling.py         # Inverse folding sampling baseline
+│   ├── uct_mcts_motif_scaffolding.py       # Motif scaffolding UCT runner
+│   ├── test_mcts_folding_ablation.py       # Folding CAMEO ablation
+│   ├── mcts_folding_ablation_pdb.py        # Folding PDB_Date ablation
+│   ├── mcts_tree_search_ablation.py        # Inverse folding CAMEO ablation
+│   ├── mcts_tree_search_ablation_pdb.py    # Inverse folding PDB_Date ablation
+│   └── test_motif_scaffolding_ablation.py  # Motif scaffolding PDB ablation
+└── scripts/                                # Slurm submission helpers, data prep, visualisation
 ```
 
-## 🚀 **NEW: General Framework Working!**
+## 🔬 **Updated Experiment Suite (2025 Q4)**
 
-### **Key Features**
+Each core task now has four canonical experiment entry points:
 
-1. **Task-Agnostic Design**: Same framework for all DPLM-2 tasks
-2. **plDDT-Based Masking**: Intelligent masking with random fallback
-3. **Simultaneous Sampling**: Leverages diffusion's multi-position sampling
-4. **Expert Rollout**: Compound rewards guide exploration
-5. **GPU Acceleration**: Full CUDA support for DPLM-2
+| Task | UCT Planner | Sampling Baseline | CAMEO Ablation | PDB Ablation |
+|------|-------------|-------------------|----------------|--------------|
+| Folding | `python tests/uct_mcts_folding.py` | `python tests/uct_sampling_folding.py` | `python tests/test_mcts_folding_ablation.py` | `python tests/mcts_folding_ablation_pdb.py` |
+| Inverse Folding | `python tests/uct_mcts_inverse_folding.py` | `python tests/inverse_folding_sampling.py` | `python tests/mcts_tree_search_ablation.py` | `python tests/mcts_tree_search_ablation_pdb.py` |
+| Motif Scaffolding | `python tests/uct_mcts_motif_scaffolding.py` | *python tests/test_motif_scaffolding_ablation.py -mode sampling* | -- | `python tests/test_motif_scaffolding_ablation.py` |
 
-### **Supported Tasks**
+Key takeaways from the latest runs:
 
-| Task Type | Description | Input | Output |
-|-----------|-------------|-------|--------|
-| `inverse_folding` | Structure → Sequence | 3D structure | Amino acid sequence |
-| `folding` | Sequence → Structure | Sequence | 3D structure |
-| `unconditional` | Generate from scratch | None | Random sequence |
-| `conditional` | Generate with constraints | Condition | Constrained sequence |
+- **UCT vs. Sampling**: UCT planners consistently outperform sampling-only baselines on TM-score and composite rewards across folding and inverse folding.
+- **CAMEO vs. PDB_Date**: Ablations on curated CAMEO targets emphasize model generalisation, while PDB_Date highlights behaviour on larger backbones.
+- **Motif Scaffolding**: PDB motif library is now wired into the ablation runner; we are finalising the sampling baseline once the non-contiguous motif templates stabilise.
 
-### **Usage Example**
+## 📦 Data Sources
 
-#### Quick Test
-```bash
-# Run comprehensive test with real CAMEO data + AAR/scTM evaluation
-python tests/test_mcts_with_real_data.py
-```
+- **CAMEO 2022** (`data-bin/cameo2022/`): sequences and structural tokens for benchmarking inverse folding and folding. Access requires the internal preprocessing script; see `utils/cameo_data_loader.py`.
+- **PDB_Date Split** (`data-bin/pdb_date/` via loaders): curated to evaluate generalisation beyond CAMEO, used in the `_pdb` ablation scripts.
+- **Motif Scaffolding Library** (`data-bin/scaffolding-pdbs/`): includes motif, reference, and scaffold target files plus supporting FASTA metadata. Required for `test_motif_scaffolding_ablation.py` and the UCT motif runner.
+- **Generated artefacts** (`generation-results/`, `mcts_diffusion_finetune/results/`): cached rollouts, inverse folding summaries, and TM-score traces used for paper figures.
 
-#### Programmatic Usage
-```python
-from core import GeneralMCTS
-from utils.cameo_data_loader import create_cameo_structure_for_testing
+All datasets are already referenced in the repo via absolute paths under `/home/caom/AID3/dplm/`. Update the loaders if you relocate the project.
 
-# Load real protein structure from CAMEO dataset
-structure = create_cameo_structure_for_testing(index=0)
-
-# Initialize MCTS for inverse folding
-mcts = GeneralMCTS(
-    task_type="inverse_folding",
-    num_simulations=30,
-    use_plddt_masking=True,
-    simultaneous_sampling=False
-)
-
-# Run search - MCTS optimizes scTM-score and AAR
-best_sequence, best_reward = mcts.search(structure, target_length=50)
-```
-
-## 🔧 Setup
+## 🔧 Environment Setup
 
 ```bash
 srun --partition=general --gres=gpu:1 --cpus-per-task=4 --mem=32G --time=2:00:00 --pty bash
@@ -112,26 +98,36 @@ export HF_HOME=/net/scratch/caom/.cache/huggingface
 export TRANSFORMERS_CACHE=/net/scratch/caom/.cache/huggingface/transformers
 export TORCH_HOME=/net/scratch/caom/.cache/torch
 
-# Test framework
+# Test all server health endpoints
+# curl http://localhost:8080/health
+# curl http://localhost:8081/health
+# curl http://localhost:8082/health
+
+# Quick smoke tests
 cd /home/caom/AID3/dplm/mcts_diffusion_finetune
-python tests/test_mcts_with_real_data.py
+python tests/uct_mcts_folding.py --mode single_expert --expert_id 0 --start 0 --end 1
+python tests/mcts_tree_search_ablation.py --mode random_no_expert --start 0 --end 1
 ```
 
-## 🎯 How It Works
+## 📊 Evaluation Protocol
 
-**DPLM-2 Self-Consistency Evaluation** (following [DPLM-2 paper](https://arxiv.org/pdf/2410.13782)):
+Evaluations now span the full multi-model ecosystem we use in the paper:
 
-1. **Generate sequence** from target structure using DPLM-2
-2. **Fold generated sequence** using ESMFold  
-3. **Compare structures** using TM-score, RMSD, pLDDT
-4. **No reference sequence needed** - pure self-consistency
+1. **Candidate Generation**  
+   - DPLM-2 variants (150M / 650M / 3B) for sequence rollouts.  
+   - External experts (ProteinMPNN, RFdiffusion, FlowFlow, Proteina) optionally contribute proposals for ensemble rollouts, especially in motif scaffolding.
 
-**MCTS Improvement Process**:
-1. Start with DPLM-2 generated sequence
-2. MCTS explores sequence variations
-3. Each variation evaluated via self-consistency
-4. Best sequences have high TM-score (structure match) + good biophysical properties
+2. **Structure Realisation**  
+   - Sequences are folded with **ESMFold** (via `EvalRunner`) for forward folding and inverse-folding validation.  
+   - RFdiffusion / FlowFlow outputs are converted back into sequence-space baselines when used as comparison models.
 
-## 📊 Expected Results
+3. **Scoring & Metrics**  
+   - **Structural**: TM-score, RMSD, scTM, motif RMSD (for scaffolding).  
+   - **Confidence**: pLDDT, entropy/novelty bonuses, ensemble disagreement.  
+   - **Biophysical**: heuristics for charge/hydrophobicity plus ProteinMPNN log-probabilities when available.
 
-MCTS consistently improves over DPLM-2 baseline by optimizing the compound reward function that includes both structural compatibility and biophysical properties. 
+4. **Result Tracking**  
+   - All runs emit JSON summaries under `mcts_diffusion_finetune/results/` (one-shot analyses, UCT/sampling comparisons, ablation tables).  
+   - Slurm wrappers gather per-task CSVs for the paper figures and ablation plots.
+
+As a trend, UCT planners give the highest composite scores, while sampling baselines serve as ablation anchors to show the contribution of search and multi-expert rollouts.

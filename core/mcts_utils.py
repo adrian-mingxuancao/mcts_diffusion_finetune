@@ -19,72 +19,175 @@ def apply_patch(parent_seq: str, proposal_seq: str, mask_idxs: Set[int]) -> str:
 
 def compute_mask_schedule(sequence: str, plddt_scores: List[float], depth: int, max_depth: int = 4) -> Set[int]:
     """
-    Adaptive masking strategy that maintains meaningful exploration at all depths.
+    Quantile-based progressive masking strategy for motif scaffolding.
     
-    Key improvements:
-    - Minimum mask sizes to ensure progress at deeper levels
-    - Entropy-based fallback when pLDDT masking is too conservative
-    - Balanced exploration vs exploitation
+    Strategy: Use quantile-based approach that becomes more conservative at deeper levels:
+    - Depth 0: Mask bottom 80% of low-confidence positions
+    - Depth 1: Mask bottom 40% of low-confidence positions  
+    - Depth 2: Mask bottom 20% of low-confidence positions
+    - Depth 3: Mask bottom 10% of low-confidence positions
+    - Depth 4+: Mask bottom 5% of low-confidence positions
+    
+    This ensures meaningful exploration while becoming more focused at deeper levels.
     """
-    # Progressive thresholds but not too aggressive
-    # Note: pLDDT scores are typically 0-100, so use appropriate thresholds
-    tau_start, tau_end = 80.0, 55.0  # Less aggressive decline
-    progress = min(1.0, depth / max_depth) if max_depth > 0 else 0
-    tau = tau_start - (tau_start - tau_end) * progress
-    
-    # Find low-confidence positions
-    # Handle both numpy arrays and lists
     import numpy as np
+    
+    # Handle both numpy arrays and lists
     if isinstance(plddt_scores, np.ndarray):
-        low_confidence = np.where(plddt_scores < tau)[0].tolist()
-    else:
-        low_confidence = [i for i, plddt in enumerate(plddt_scores) if plddt < tau]
-    
-    # Sort by confidence (lowest first) for prioritization
-    if low_confidence:
-        # Handle numpy arrays properly
-        if isinstance(plddt_scores, np.ndarray):
-            scored_positions = [(i, float(plddt_scores[i])) for i in low_confidence]
+        # Handle multi-dimensional pLDDT (e.g., per-atom confidence)
+        if plddt_scores.ndim > 1:
+            # Use MIN across atoms for per-residue confidence (most conservative)
+            plddt_per_residue = np.min(plddt_scores, axis=-1)
         else:
-            scored_positions = [(i, plddt_scores[i]) for i in low_confidence]
-        scored_positions.sort(key=lambda x: x[1])  # Sort by pLDDT ascending
-        mask = [pos for pos, _ in scored_positions]
+            plddt_per_residue = plddt_scores
     else:
-        mask = []
+        plddt_per_residue = np.array(plddt_scores)
     
-    # Adaptive mask sizing with guaranteed minimums
     seq_len = len(sequence)
+    
+    # **NEW**: Quantile-based masking percentages
     if depth == 0:
-        # Root: substantial exploration (15-25%)
-        min_positions = max(8, int(seq_len * 0.15))
-        max_positions = int(seq_len * 0.25)
-    elif depth <= 2:
-        # Mid depths: moderate exploration (8-18%)
-        min_positions = max(5, int(seq_len * 0.08))
-        max_positions = int(seq_len * 0.18)
+        mask_percentage = 0.80  # 80% at depth 0
+    elif depth == 1:
+        mask_percentage = 0.40  # 40% at depth 1
+    elif depth == 2:
+        mask_percentage = 0.20  # 20% at depth 2
+    elif depth == 3:
+        mask_percentage = 0.10  # 10% at depth 3
     else:
-        # Deep levels: focused but meaningful (5-12%)
-        min_positions = max(3, int(seq_len * 0.05))
-        max_positions = max(8, int(seq_len * 0.12))
+        mask_percentage = 0.05  # 5% at depth 4+
     
-    if len(mask) > max_positions:
-        # Keep only the lowest confidence positions
-        mask = mask[:max_positions]
-    elif len(mask) < min_positions:
-        # Fallback: add random medium-confidence positions to ensure progress
-        if isinstance(plddt_scores, np.ndarray):
-            medium_conf_mask = (plddt_scores >= tau) & (plddt_scores < (tau + 15.0))
-            medium_conf = np.where(medium_conf_mask)[0].tolist()
+    # Calculate number of positions to mask
+    num_to_mask = max(1, int(seq_len * mask_percentage))  # At least 1 position
+    
+    # **NEW**: Use quantile-based selection instead of threshold-based
+    # Sort all positions by confidence (lowest first)
+    position_confidence = [(i, float(plddt_per_residue[i])) for i in range(seq_len)]
+    position_confidence.sort(key=lambda x: x[1])  # Sort by pLDDT ascending
+    
+    # Take the lowest confidence positions up to the percentage
+    mask_positions = [pos for pos, _ in position_confidence[:num_to_mask]]
+    
+    # Calculate the actual confidence threshold used
+    if num_to_mask < len(position_confidence):
+        threshold_plddt = position_confidence[num_to_mask-1][1]
+    else:
+        threshold_plddt = position_confidence[-1][1] if position_confidence else 0.0
+    
+    print(f"🎯 Depth {depth}: masking {len(mask_positions)} positions ({mask_percentage*100:.0f}% quantile), pLDDT threshold ≤ {threshold_plddt:.1f}")
+    
+    return set(mask_positions)
+
+
+def compute_mask_schedule_inverse_folding(sequence: str, plddt_scores: List[float], depth: int, max_depth: int = 4) -> Set[int]:
+    """
+    Hybrid threshold + quantile progressive masking strategy for inverse folding.
+    
+    For inverse folding, we have high confidence in the structure, so we prefer to mask
+    low pLDDT areas. Uses a hybrid approach:
+    1. **Primary**: Threshold-based masking (conservative)
+    2. **Fallback**: Quantile-based masking if too few positions
+    
+    Strategy: 
+    - **Threshold approach**: Use conservative pLDDT thresholds that become more stringent at deeper levels:
+      - Depth 0: Mask positions with pLDDT < 70
+      - Depth 1: Mask positions with pLDDT < 60  
+      - Depth 2: Mask positions with pLDDT < 50
+      - Depth 3: Mask positions with pLDDT < 40
+      - Depth 4+: Mask positions with pLDDT < 30
+    
+    - **Fallback**: If threshold approach gives < 5% of sequence, use quantile-based:
+      - Depth 0: Mask bottom 30% by pLDDT (broad exploration)
+      - Depth 1: Mask bottom 20% by pLDDT
+      - Depth 2: Mask bottom 15% by pLDDT
+      - Depth 3: Mask bottom 10% by pLDDT
+      - Depth 4+: Mask bottom 5% by pLDDT (focused refinement)
+    
+    This ensures we always have sufficient positions for meaningful MCTS exploration while
+    preserving high-confidence structure regions when possible.
+    """
+    import numpy as np
+    
+    # Handle both numpy arrays and lists
+    if isinstance(plddt_scores, np.ndarray):
+        # Handle multi-dimensional pLDDT (e.g., per-atom confidence)
+        if plddt_scores.ndim > 1:
+            # Use MIN across atoms for per-residue confidence (most conservative)
+            plddt_per_residue = np.min(plddt_scores, axis=-1)
         else:
-            medium_conf = [i for i, plddt in enumerate(plddt_scores) 
-                          if tau <= plddt < (tau + 15.0)]
-        if medium_conf:
-            needed = min_positions - len(mask)
-            additional = random.sample(medium_conf, min(needed, len(medium_conf)))
-            mask.extend(additional)
+            plddt_per_residue = plddt_scores
+    else:
+        plddt_per_residue = np.array(plddt_scores)
     
-    print(f"Depth {depth}: threshold={tau:.2f}, found {len(mask)} positions to mask")
-    return set(mask)
+    seq_len = len(sequence)
+    
+    # **CONSERVATIVE**: Threshold-based masking for inverse folding
+    if depth == 0:
+        threshold = 70.0  # Only mask really low confidence regions
+    elif depth == 1:
+        threshold = 60.0  # Slightly more aggressive
+    elif depth == 2:
+        threshold = 50.0  # Moderate threshold
+    elif depth == 3:
+        threshold = 40.0  # Lower threshold
+    else:
+        threshold = 30.0  # Very low threshold for deep exploration
+    
+    # Find positions below the threshold
+    mask_positions = []
+    for i in range(seq_len):
+        if float(plddt_per_residue[i]) < threshold:
+            mask_positions.append(i)
+    
+    # **HYBRID APPROACH**: Threshold first, quantile fallback if too few positions
+    min_positions_needed = max(3, seq_len // 20)  # At least 5% of sequence or minimum 3 positions
+    max_positions_allowed = min(seq_len // 4, 50)  # At most 25% of sequence or 50 positions
+    
+    if len(mask_positions) < min_positions_needed:
+        print(f"🎯 Depth {depth}: threshold approach gave {len(mask_positions)} positions, falling back to quantile approach")
+        
+        # **FALLBACK**: Use quantile-based masking to ensure sufficient positions
+        # Progressive quantiles based on depth (MORE masking at shallow depths, LESS at deep depths)
+        if depth == 0:
+            quantile = 0.3  # Mask bottom 30% (broad exploration)
+        elif depth == 1:
+            quantile = 0.2  # Mask bottom 20%
+        elif depth == 2:
+            quantile = 0.15  # Mask bottom 15%
+        elif depth == 3:
+            quantile = 0.1  # Mask bottom 10%
+        else:
+            quantile = 0.05  # Mask bottom 5% (focused refinement at terminal nodes)
+        
+        # Calculate quantile threshold
+        quantile_threshold = np.percentile(plddt_per_residue, quantile * 100)
+        
+        # Find positions below quantile threshold
+        mask_positions = []
+        for i in range(seq_len):
+            if float(plddt_per_residue[i]) < quantile_threshold:
+                mask_positions.append(i)
+        
+        # Ensure we have enough positions
+        if len(mask_positions) < min_positions_needed:
+            # Take the lowest confidence positions
+            position_confidence = [(i, float(plddt_per_residue[i])) for i in range(seq_len)]
+            position_confidence.sort(key=lambda x: x[1])  # Sort by pLDDT ascending
+            mask_positions = [pos for pos, _ in position_confidence[:min_positions_needed]]
+            print(f"🎯 Depth {depth}: quantile fallback insufficient, masking {len(mask_positions)} lowest confidence positions")
+        else:
+            print(f"🎯 Depth {depth}: quantile fallback masking {len(mask_positions)} positions below {quantile_threshold:.1f} ({len(mask_positions)/seq_len*100:.1f}%)")
+    
+    elif len(mask_positions) > max_positions_allowed:
+        # If too many positions, take the lowest confidence ones
+        position_confidence = [(i, float(plddt_per_residue[i])) for i in mask_positions]
+        position_confidence.sort(key=lambda x: x[1])  # Sort by pLDDT ascending
+        mask_positions = [pos for pos, _ in position_confidence[:max_positions_allowed]]
+        print(f"🎯 Depth {depth}: threshold approach gave too many positions, limiting to {len(mask_positions)} lowest confidence")
+    else:
+        print(f"🎯 Depth {depth}: threshold approach masking {len(mask_positions)} positions with pLDDT < {threshold:.1f} ({len(mask_positions)/seq_len*100:.1f}%)")
+    
+    return set(mask_positions)
 
 
 def compute_sequence_hash(sequence: str) -> str:
@@ -133,26 +236,21 @@ def ph_uct_score(average_value: float, visit_count: int, parent_visits: int,
                  c: float = 1.414, w_ent: float = 0.1, w_div: float = 0.1, 
                  entropy_proposals: float = 0.0, novelty_vs_parent: float = 0.0) -> float:
     """
-    PH-UCT score matching ERP paper formula:
-    Q + cp * p * log(N(st)) / (1 + N(st,a)) * π_τ(a|st) * (1/e) * Σ H(π_τ(·|st+i))
+    PH-UCT score matching ERP paper formula with multiplication.
     
-    The key difference from standard UCB is multiplication (*) instead of addition (+) 
-    for the entropy term, following the ERP paper's formulation.
+    ERP formula: Q + c * sqrt(log(N) / n) * entropy_factor + diversity_bonus
     """
     if visit_count == 0:
         return float('inf')
     
-    # Core UCB term: Q + c * sqrt(log(N(st)) / N(st,a))
+    # Core UCB exploration term
     ucb_exploration = c * math.sqrt(math.log(parent_visits + 1) / (visit_count + 1))
     
-    # ERP paper formula: multiply exploration by entropy-weighted policy probability
-    # π_τ(a|st) * (1/e) * Σ H(π_τ(·|st+i)) approximated as entropy_proposals
+    # ERP paper: multiply exploration by entropy factor
     entropy_factor = (1.0 / math.e) * entropy_proposals if entropy_proposals > 0 else 1.0
-    
-    # Apply ERP multiplication: exploration term is scaled by entropy
     ph_exploration = ucb_exploration * entropy_factor
     
-    # Diversity bonus (novelty) is still additive
+    # Diversity bonus is additive
     diversity_bonus = w_div * novelty_vs_parent
     
     return average_value + ph_exploration + diversity_bonus

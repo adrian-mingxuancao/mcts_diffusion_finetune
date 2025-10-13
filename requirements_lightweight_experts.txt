@@ -1,0 +1,9 @@
+# Lightweight requirements for external experts
+requests>=2.25.0
+flask>=2.0.0
+loguru>=0.6.0
+biopython>=1.79
+# ProteInA specific (if not available)
+loralib>=0.1.0
+einops>=0.6.0
+# FoldFlow/RFDiffusion will use existing PyTorch from dplm env

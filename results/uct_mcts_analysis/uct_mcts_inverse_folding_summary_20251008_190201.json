@@ -1,0 +1,17 @@
+{
+  "single_expert_0": {
+    "mode": "single_expert_0",
+    "num_structures": 1,
+    "aar_improvement_mean": -0.007042253521126751,
+    "aar_improvement_std": 0.0,
+    "aar_improvement_min": -0.007042253521126751,
+    "aar_improvement_max": -0.007042253521126751,
+    "bio_improvement_mean": -0.007042253521126751,
+    "bio_improvement_std": 0.0,
+    "sctm_improvement_mean": 0.016109999999999958,
+    "sctm_improvement_std": 0.0,
+    "search_time_mean": 858.3978350162506,
+    "search_time_std": 0.0,
+    "success_rate": 1.0
+  }
+}
