@@ -62,28 +62,14 @@ from byprot.utils.protein import utils as eu
 from byprot.datamodules.pdb_dataset.pdb_datamodule import collate_fn
 from omegaconf import DictConfig, OmegaConf
 import pandas as pd
+from utils.folding_metrics import evaluate_folding_metrics, calculate_folding_reward
 
 def setup_logging():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def calculate_biophysical_score(sequence: str) -> float:
-    """Calculate biophysical score using same heuristic as forward folding summary"""
-    if not sequence:
-        return 0.0
-    seq = sequence.upper()
-    length = len(seq)
-    hydrophobic = sum(1 for aa in seq if aa in "AILMFPWV") / length
-    charged = sum(1 for aa in seq if aa in "DEKR") / length
-    charge_penalty = max(0, charged - 0.3) * 2.0
-    hydrophobic_penalty = max(0, hydrophobic - 0.4) * 2.0
-    base_score = 1.0 - charge_penalty - hydrophobic_penalty
-    return float(np.clip(base_score, 0.0, 1.0))
-
 def calculate_composite_reward(tm_score: float, sequence: str) -> float:
-    """Calculate composite reward using same formula as forward folding summary"""
-    aar = 1.0  # sequences identical to reference for folding task
-    biophysical = calculate_biophysical_score(sequence)
-    return 0.4 * aar + 0.45 * tm_score + 0.15 * biophysical
+    """Wrapper to keep legacy name while sharing folding reward helper."""
+    return calculate_folding_reward(tm_score, sequence)
 
 def create_evaluator_config() -> DictConfig:
     """Create configuration for EvalRunner"""
@@ -168,55 +154,11 @@ def evaluate_structure_with_evaluator(predicted_coords: np.ndarray, reference_co
                 return rmsd, tm_score, composite_reward
             else:
                 print(f"⚠️ Results CSV not found: {results_csv}")
-                return calculate_simple_metrics(predicted_coords[:, 1, :], reference_coords[:, 1, :], predicted_seq)
+                return evaluate_folding_metrics(predicted_coords[:, 1, :], reference_coords[:, 1, :], predicted_seq)
                 
     except Exception as e:
         print(f"⚠️ Real evaluator failed: {e}, using fallback")
-        # Extract CA coordinates if needed
-        if len(predicted_coords.shape) == 3:
-            pred_ca = predicted_coords[:, 1, :]
-        else:
-            pred_ca = predicted_coords
-            
-        if len(reference_coords.shape) == 3:
-            ref_ca = reference_coords[:, 1, :]
-        else:
-            ref_ca = reference_coords
-            
-        return calculate_simple_metrics(pred_ca, ref_ca, predicted_seq)
-
-def calculate_simple_metrics(predicted_coords: np.ndarray, reference_coords: np.ndarray, sequence: str) -> Tuple[float, float, float]:
-    """Fallback simple metrics calculation"""
-    try:
-        pred_coords = np.array(predicted_coords)
-        ref_coords = np.array(reference_coords)
-        
-        # Handle length mismatches
-        min_len = min(len(pred_coords), len(ref_coords))
-        pred_coords = pred_coords[:min_len]
-        ref_coords = ref_coords[:min_len]
-        
-        if len(pred_coords) == 0:
-            return float('inf'), 0.0
-        
-        # Calculate RMSD
-        rmsd = np.sqrt(np.mean(np.sum((pred_coords - ref_coords) ** 2, axis=1)))
-        
-        # Calculate TM-score
-        L_target = len(ref_coords)
-        d_0 = 1.24 * ((L_target - 15) ** (1/3)) - 1.8 if L_target > 15 else 0.5
-        
-        distances = np.sqrt(np.sum((pred_coords - ref_coords) ** 2, axis=1))
-        tm_score = np.sum(1.0 / (1.0 + (distances / d_0) ** 2)) / L_target
-        
-        # Calculate composite reward
-        composite_reward = calculate_composite_reward(tm_score, sequence)
-        
-        return rmsd, tm_score, composite_reward
-        
-    except Exception as e:
-        print(f"    ⚠️ RMSD/TM-score calculation failed: {e}")
-        return float('inf'), 0.0, 0.0
+        return evaluate_folding_metrics(predicted_coords, reference_coords, predicted_seq)
 
 def load_cameo_sequences() -> Dict[str, str]:
     """Load CAMEO reference sequences"""

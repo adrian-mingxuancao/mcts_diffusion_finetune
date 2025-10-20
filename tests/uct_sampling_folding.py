@@ -43,6 +43,7 @@ from Bio import SeqIO
 # Core imports
 from core.sequence_level_mcts import GeneralMCTS
 from core.dplm2_integration import DPLM2Integration
+from utils.folding_metrics import evaluate_folding_metrics, calculate_folding_reward
 
 def setup_logging():
     """Setup logging configuration"""
@@ -295,41 +296,22 @@ def run_uct_sampling_folding_experiment(
             print(f"  ⚠️ No structure tokens from ESMFold, using mask tokens")
             baseline_structure_tokens = f"<cls_struct>{'<mask_struct>' * len(sequence)}<eos_struct>"
         
-        # Step 2: Evaluate baseline with DPLM2Evaluator
-        print(f"  📊 Evaluating baseline with DPLM2Evaluator...")
-        try:
-            from evaluator.evaluator_dplm2 import DPLM2Evaluator
-            evaluator = DPLM2Evaluator(
-                model_name="airkingbd/dplm2_150m",
-                output_dir="/tmp/forward_folding",
-                task="forward_folding"
-            )
-            
-            # Create evaluation data
-            eval_data = [{
-                'sequence': sequence,
-                'length': len(sequence),
-                'target_length': len(sequence),
-                'structure_id': structure_id
-            }]
-            
-            # Run evaluation
-            results = evaluator.evaluate(eval_data)
-            if results and len(results) > 0:
-                baseline_rmsd = results[0].get('rmsd', 25.0)
-                baseline_tm = results[0].get('tm_score', 0.1)
-                baseline_reward = 0.4 * (1.0 - min(baseline_rmsd / 50.0, 1.0)) + 0.6 * baseline_tm
+        # Step 2: Evaluate baseline using shared folding metrics
+        print(f"  📊 Evaluating baseline metrics...")
+        if reference_coords is not None:
+            try:
+                baseline_rmsd, baseline_tm, baseline_reward = evaluate_folding_metrics(
+                    baseline_coords,
+                    reference_coords,
+                    sequence,
+                )
                 print(f"  ✅ Baseline: RMSD={baseline_rmsd:.3f}Å, TM={baseline_tm:.3f}, Reward={baseline_reward:.3f}")
-            else:
-                raise Exception("Evaluator returned no results")
-                
-        except Exception as e:
-            print(f"  ⚠️ Real evaluator failed: {e}, using fallback")
-            # Fallback evaluation
-            baseline_rmsd = np.sqrt(np.mean(np.sum((baseline_coords - reference_coords[:len(baseline_coords)]) ** 2, axis=1)))
-            baseline_tm = 0.122  # Fallback TM-score
-            baseline_reward = 0.4 * (1.0 - min(baseline_rmsd / 50.0, 1.0)) + 0.6 * baseline_tm
-            print(f"  ✅ Baseline: RMSD={baseline_rmsd:.3f}Å, TM={baseline_tm:.3f}, Reward={baseline_reward:.3f}")
+            except Exception as exc:
+                print(f"  ⚠️ Baseline metric computation failed: {exc}")
+                baseline_rmsd, baseline_tm, baseline_reward = float('nan'), float('nan'), 0.0
+        else:
+            print("  ⚠️ Reference coordinates unavailable; baseline reward set to 0")
+            baseline_rmsd, baseline_tm, baseline_reward = float('nan'), float('nan'), 0.0
         
         # Step 3: Initialize DPLM-2 integration
         print(f"  🔄 Initializing DPLM-2 integration for forward folding...")
@@ -428,8 +410,24 @@ def run_uct_sampling_folding_experiment(
                 final_rmsd = getattr(best_candidate, 'rmsd', baseline_rmsd)
                 final_tm = getattr(best_candidate, 'tm_score', baseline_tm)
                 final_reward = getattr(best_candidate, 'reward', baseline_reward)
-                delta_rmsd = baseline_rmsd - final_rmsd
-                delta_tm = final_tm - baseline_tm
+                
+                candidate_coords = getattr(best_candidate, 'coordinates', None)
+                if candidate_coords is not None and reference_coords is not None:
+                    try:
+                        final_rmsd, final_tm, final_reward = evaluate_folding_metrics(
+                            candidate_coords,
+                            reference_coords,
+                            sequence,
+                        )
+                    except Exception as exc:
+                        print(f"  ⚠️ Final metric computation failed: {exc}")
+                        if not np.isnan(final_tm):
+                            final_reward = calculate_folding_reward(final_tm, sequence)
+                elif reference_coords is not None and not np.isnan(final_tm):
+                    final_reward = calculate_folding_reward(final_tm, sequence)
+                
+                delta_rmsd = (baseline_rmsd - final_rmsd) if not np.isnan(baseline_rmsd) and not np.isnan(final_rmsd) else float('nan')
+                delta_tm = (final_tm - baseline_tm) if not np.isnan(baseline_tm) and not np.isnan(final_tm) else float('nan')
 
                 print(f"  ✅ Final: RMSD={final_rmsd:.3f}Å, TM={final_tm:.3f}, Reward={final_reward:.3f}")
                 print(f"  📊 Improvement: ΔRMSD={delta_rmsd:+.3f}Å, ΔTM={delta_tm:+.3f}")

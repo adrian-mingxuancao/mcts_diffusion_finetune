@@ -1,0 +1,8 @@
+[
+  {
+    "structure_id": "5S9R",
+    "mode": "multi_expert",
+    "success": false,
+    "error": "argument of type 'MCTSNode' is not iterable"
+  }
+]

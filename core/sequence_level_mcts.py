@@ -21,6 +21,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.dplm2_integration import DPLM2Integration
 from utils.structure_converter import get_structure_converter
+from utils.folding_metrics import (
+    evaluate_folding_metrics,
+    calculate_folding_reward,
+)
 
 
 @dataclass
@@ -725,23 +729,23 @@ class GeneralMCTS:
         # Progressive thresholds by depth (lower threshold = more masking)
         if depth == 0:
             threshold = 70.0  # Mask positions with pLDDT < 70
-            target_ratio = 0.08  # Fallback: 8% for root
+            target_ratio = 0.25  # Fallback: mask ~25% at root
         elif depth == 1:
             threshold = 75.0  # Mask positions with pLDDT < 75
-            target_ratio = 0.06  # Fallback: 6% for depth 1
+            target_ratio = 0.20  # Fallback: mask ~20% one level down
         elif depth == 2:
             threshold = 80.0  # Mask positions with pLDDT < 80
-            target_ratio = 0.04  # Fallback: 4% for depth 2
+            target_ratio = 0.15  # Fallback: mask ~15% deeper
         else:
             threshold = 85.0  # Mask positions with pLDDT < 85
-            target_ratio = 0.02  # Fallback: 2% for deeper depths
+            target_ratio = 0.10  # Fallback: mask ~10% at deeper depths
         
         # Method 1: Threshold-based masking (default)
         threshold_masked = set([i for i, score in enumerate(plddt_scores) if score < threshold])
         
         # Check if threshold masking gives reasonable number of positions
-        min_positions = max(3, int(len(sequence) * 0.01))  # At least 1% or 3 positions
-        max_positions = int(len(sequence) * 0.25)  # At most 25% of sequence
+        min_positions = max(3, int(len(sequence) * 0.05))  # At least 5% or 3 positions
+        max_positions = int(len(sequence) * 0.30)  # At most 30% of sequence
         
         if min_positions <= len(threshold_masked) <= max_positions:
             # Threshold masking is good
@@ -758,7 +762,8 @@ class GeneralMCTS:
             
             # Take lowest confidence positions
             masked_positions = set([pos for pos, _ in position_scores[:num_to_mask]])
-            print(f"      🎭 Depth {depth} quantile masking (fallback): {len(masked_positions)}/{len(sequence)} positions ({target_ratio*100:.1f}%)")
+            actual_ratio = len(masked_positions) / len(sequence) if sequence else 0.0
+            print(f"      🎭 Depth {depth} quantile masking (fallback): {len(masked_positions)}/{len(sequence)} positions ({actual_ratio*100:.1f}%)")
             print(f"         Reason: Threshold masking gave {len(threshold_masked)} positions (outside {min_positions}-{max_positions} range)")
         
         return masked_positions
@@ -1000,44 +1005,40 @@ class GeneralMCTS:
             return [70.0] * len(coords)
     
     def _evaluate_structure_reward(self, coords: np.ndarray, sequence: str) -> float:
-        """Evaluate structure reward based on coordinates vs reference"""
+        """Evaluate structure reward based on coordinates vs reference."""
         try:
             self._last_structure_eval = None
-            # Get reference coordinates (ground truth preferred)
             reference_coords = self.reference_coords
             if reference_coords is None:
                 reference_coords = self.baseline_structure.get('target_coordinates')
             if reference_coords is None:
                 reference_coords = self.baseline_structure.get('coordinates')
-            if reference_coords is None:
+            if reference_coords is None or coords is None:
                 return 0.0
             
-            # Calculate RMSD and TM-score using simple metrics
-            import numpy as np
+            sequence_for_reward = sequence
+            if not sequence_for_reward:
+                sequence_for_reward = self.reference_sequence
+            if not sequence_for_reward:
+                sequence_for_reward = self.baseline_structure.get('sequence')
+            if not sequence_for_reward:
+                sequence_for_reward = ""
             
-            # Simple RMSD calculation
-            if coords.shape == reference_coords.shape:
-                rmsd = np.sqrt(np.mean((coords - reference_coords) ** 2))
-            else:
-                # Handle shape mismatch by using minimum length
-                min_len = min(len(coords), len(reference_coords))
-                rmsd = np.sqrt(np.mean((coords[:min_len] - reference_coords[:min_len]) ** 2))
-            
-            # Simple TM-score approximation (inverse relationship with RMSD)
-            tm_score = 1.0 / (1.0 + (rmsd / 5.0) ** 2)  # Normalize around 5Å
-            
-            # Calculate composite reward (same as folding script)
-            aar = 1.0  # Sequence is fixed for folding
-            biophysical = self._calculate_biophysical_score(sequence)
-            reward = 0.4 * aar + 0.45 * tm_score + 0.15 * biophysical
+            rmsd, tm_score, reward = evaluate_folding_metrics(
+                coords,
+                reference_coords,
+                sequence_for_reward,
+            )
+            print(
+                "      📊 Folding metrics: "
+                f"RMSD={rmsd:.3f}Å, TM={tm_score:.3f}, Reward={reward:.3f}"
+            )
             self._last_structure_eval = {
                 'rmsd': float(rmsd),
                 'tm_score': float(tm_score),
                 'reward': float(reward),
             }
-            
             return reward
-            
         except Exception as e:
             print(f"      ⚠️ Structure reward calculation failed: {e}")
             self._last_structure_eval = None
@@ -1046,28 +1047,15 @@ class GeneralMCTS:
     def _compute_structure_reward(self, rmsd: float, tm_score: float) -> float:
         """Compatibility helper: compute folding reward from RMSD/TM metrics."""
         try:
-            aar = 1.0
-            biophysical = 1.0  # Sequence fixed in folding tasks
-            # Mirror _evaluate_structure_reward composite weights
-            reward = 0.4 * aar + 0.45 * tm_score + 0.15 * biophysical
-            return float(np.clip(reward, 0.0, 1.0))
+            sequence = (
+                self.reference_sequence
+                or self.baseline_structure.get('sequence')
+                or ""
+            )
+            return calculate_folding_reward(tm_score, sequence)
         except Exception as e:
             print(f"      ⚠️ Structure reward helper failed: {e}")
             return 0.0
-    
-    def _calculate_biophysical_score(self, sequence: str) -> float:
-        """Calculate biophysical score based on amino acid composition"""
-        if not sequence:
-            return 0.0
-        
-        seq = sequence.upper()
-        length = len(seq)
-        hydrophobic = sum(1 for aa in seq if aa in "AILMFPWV") / length
-        charged = sum(1 for aa in seq if aa in "DEKR") / length
-        charge_penalty = max(0, charged - 0.3) * 2.0
-        hydrophobic_penalty = max(0, hydrophobic - 0.4) * 2.0
-        base_score = 1.0 - charge_penalty - hydrophobic_penalty
-        return float(np.clip(base_score, 0.0, 1.0))
     
     def _compute_expert_entropy(self, sequence: str, expert: str, masked_positions: Set[int]) -> float:
         """Compute predictive entropy using correct logit extraction methods."""

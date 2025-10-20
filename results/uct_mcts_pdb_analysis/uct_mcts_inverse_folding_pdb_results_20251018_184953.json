@@ -1,0 +1,21 @@
+[
+  {
+    "structure_id": "5S9R",
+    "mode": "multi_expert",
+    "baseline_aar": 0.9841269841269841,
+    "final_aar": 0.9841269841269841,
+    "aar_improvement": 0.0,
+    "baseline_sctm": 0.7194,
+    "final_sctm": 0.63536,
+    "sctm_improvement": -0.08404,
+    "baseline_biophysical": 0.9333333333333333,
+    "final_biophysical": 0.9452380952380952,
+    "baseline_reward": 0.8573807936507937,
+    "final_reward": 0.8213485079365079,
+    "reward_improvement": -0.03603228571428574,
+    "num_iterations": 2,
+    "max_depth": 1,
+    "best_sequence": "SNMNPPPPETSNPNKPKRQTNQLQYLLRVVLKTLWKHQFAWPFQQPVDAVKLNLPDYYKIIKTPMDMGTIKKRLENNYYWNAQECIQDFNTMFTNCYIYNKPGDDIVLMAEALEKLFLQKINELPT",
+    "success": true
+  }
+]

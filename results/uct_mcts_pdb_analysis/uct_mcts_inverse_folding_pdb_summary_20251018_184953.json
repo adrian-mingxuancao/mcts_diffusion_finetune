@@ -1,0 +1,28 @@
+{
+  "total_experiments": 1,
+  "successful_experiments": 1,
+  "failed_experiments": 0,
+  "modes": {
+    "multi_expert": {
+      "count": 1,
+      "aar_improvement": {
+        "mean": 0.0,
+        "std": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "sctm_improvement": {
+        "mean": -0.08404,
+        "std": 0.0,
+        "min": -0.08404,
+        "max": -0.08404
+      },
+      "reward_improvement": {
+        "mean": -0.03603228571428574,
+        "std": 0.0,
+        "min": -0.03603228571428574,
+        "max": -0.03603228571428574
+      }
+    }
+  }
+}

@@ -164,6 +164,27 @@ class PDBDataLoader:
         """Get structure sequence by name."""
         return self.structure_sequences.get(name)
     
+    def get_structure_data(self, structure_id: str) -> Optional[Dict[str, Any]]:
+        """Get structure data by ID, handling the directory structure properly."""
+        # For structure ID like "5S9R", use middle two characters for subdirectory
+        if len(structure_id) >= 4:
+            # Use characters 1 and 2 (0-indexed) for subdirectory
+            subdir = structure_id[1:3].lower()  # "5S9R" -> "s9"
+            pkl_file = f"{structure_id}.pkl"
+            structure_path = os.path.join(self.preprocessed_path, subdir, pkl_file)
+            
+            if os.path.exists(structure_path):
+                try:
+                    with open(structure_path, 'rb') as f:
+                        structure_data = pickle.load(f)
+                    return structure_data
+                except Exception as e:
+                    print(f"❌ Error loading structure {structure_id}: {e}")
+                    return None
+        
+        # Fallback to searching through all structures
+        return self.get_structure_by_name(structure_id)
+    
     def get_test_structure(self, index: int = 0) -> Dict[str, Any]:
         """Get a test structure for debugging."""
         structure_data = self.get_structure_by_index(index)

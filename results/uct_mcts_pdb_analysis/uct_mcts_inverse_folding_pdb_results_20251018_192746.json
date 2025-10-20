@@ -1,0 +1,40 @@
+[
+  {
+    "structure_id": "5S9R",
+    "mode": "multi_expert",
+    "baseline_aar": 0.9841269841269841,
+    "final_aar": 0.9603174603174603,
+    "aar_improvement": -0.023809523809523725,
+    "baseline_sctm": 0.63537,
+    "final_sctm": 0.61539,
+    "sctm_improvement": -0.019979999999999998,
+    "baseline_biophysical": 0.9452380952380952,
+    "final_biophysical": 0.9571428571428572,
+    "baseline_reward": 0.821353007936508,
+    "final_reward": 0.8046239126984127,
+    "reward_improvement": -0.016729095238095293,
+    "num_iterations": 3,
+    "max_depth": 2,
+    "best_sequence": "EYPDPKPPETSNPNKPKRQTNQLQYLLRVVLKTLWKHQFAWPFQQPVDAVKLNLPDYYKIIKTPMDMGTIKKRLENNYYWNAQECIQDFNTMFTNCYIYNKPGDDIVLMAEALEKLFLQKINELPT",
+    "success": true
+  },
+  {
+    "structure_id": "5SBK",
+    "mode": "multi_expert",
+    "baseline_aar": 0.5466666666666666,
+    "final_aar": 1.0,
+    "aar_improvement": 0.45333333333333337,
+    "baseline_sctm": 0.5466666666666666,
+    "final_sctm": 0.5466666666666666,
+    "sctm_improvement": 0.0,
+    "baseline_biophysical": 1.0,
+    "final_biophysical": 1.0,
+    "baseline_reward": 0.6146666666666667,
+    "final_reward": 0.796,
+    "reward_improvement": 0.18133333333333335,
+    "num_iterations": 3,
+    "max_depth": 2,
+    "best_sequence": "NQIDLNVTCRYAGVFHVEKNGRYSISRTEAADLCQAFNSTLPTMDQMKLALSKGFETCRYGFIEGNVVIPRIHPNAICAANHTGVYILVTSNTSHYDTYCFNASAPPEEDCTSVTDLPNSFDGPVTITIVNRDGTRYSKKGEYRTHQEDI",
+    "success": true
+  }
+]

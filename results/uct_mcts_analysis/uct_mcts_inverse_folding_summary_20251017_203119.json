@@ -1,0 +1,17 @@
+{
+  "multi_expert": {
+    "mode": "multi_expert",
+    "num_structures": 1,
+    "aar_improvement_mean": 0.014084507042253502,
+    "aar_improvement_std": 0.0,
+    "aar_improvement_min": 0.014084507042253502,
+    "aar_improvement_max": 0.014084507042253502,
+    "bio_improvement_mean": 0.0,
+    "bio_improvement_std": 0.0,
+    "sctm_improvement_mean": 0.0571299999999999,
+    "sctm_improvement_std": 0.0,
+    "search_time_mean": 209.0091733932495,
+    "search_time_std": 0.0,
+    "success_rate": 1.0
+  }
+}

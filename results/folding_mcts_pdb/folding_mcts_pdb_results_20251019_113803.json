@@ -1,0 +1,19 @@
+[
+  {
+    "structure_id": "5S9R",
+    "mode": "multi_expert",
+    "sequence_length": 126,
+    "baseline_rmsd": 20.789770326842355,
+    "baseline_tm_score": 0.03916416975791193,
+    "baseline_reward": 0.19244244691744067,
+    "final_rmsd": 24.882825118250132,
+    "final_tm_score": 0.06100192593906043,
+    "final_reward": 0.20991265186235947,
+    "rmsd_improvement": -4.093054791407777,
+    "tm_score_improvement": 0.0218377561811485,
+    "reward_improvement": 0.0174702049449188,
+    "num_iterations": 1,
+    "max_depth": 1,
+    "success": true
+  }
+]

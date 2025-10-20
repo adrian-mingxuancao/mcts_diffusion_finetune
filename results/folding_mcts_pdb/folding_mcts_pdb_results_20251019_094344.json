@@ -1,0 +1,12 @@
+[
+  {
+    "structure_id": "5S9R",
+    "success": false,
+    "error": "name 'compute_esmfold_baseline_structure' is not defined"
+  },
+  {
+    "structure_id": "5SBK",
+    "success": false,
+    "error": "name 'compute_esmfold_baseline_structure' is not defined"
+  }
+]

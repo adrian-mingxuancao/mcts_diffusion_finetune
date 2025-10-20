@@ -1,0 +1,9 @@
+{
+  "total_experiments": 1,
+  "successful": 1,
+  "success_rate": 1.0,
+  "avg_rmsd_improvement": 0.0,
+  "avg_tm_score_improvement": 0.0,
+  "mode": "multi_expert",
+  "timestamp": "20251019_094811"
+}
