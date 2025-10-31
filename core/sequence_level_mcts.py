@@ -29,9 +29,10 @@ from utils.folding_metrics import (
 
 @dataclass
 class MCTSNode:
-    """MCTS node with entropy and novelty for PH-UCT."""
-    sequence: str
-    masked_positions: Set[int]
+    """MCTS node with complete sequences and mutable position tracking."""
+    sequence: str                           # COMPLETE sequence (no X's)
+    mutable_positions: Set[int]            # Positions that can be changed (low pLDDT)
+    frozen_positions: Set[int] = None      # Positions that are frozen (high pLDDT)
     reward: float = 0.0
     visits: int = 0
     total_reward: float = 0.0
@@ -51,6 +52,15 @@ class MCTSNode:
     def __post_init__(self):
         if self.children is None:
             self.children = []
+        # Auto-compute frozen positions if not provided
+        if self.frozen_positions is None:
+            all_positions = set(range(len(self.sequence)))
+            self.frozen_positions = all_positions - self.mutable_positions
+    
+    @property
+    def masked_positions(self) -> Set[int]:
+        """Backward compatibility - return mutable positions"""
+        return self.mutable_positions
     
     def ph_uct_score(self, exploration_constant: float = 1.414, 
                      entropy_weight: float = 0.1, novelty_weight: float = 0.05) -> float:
@@ -120,7 +130,10 @@ class GeneralMCTS:
         self.exploration_constant = exploration_constant
         self.use_ph_uct = use_ph_uct  # Store UCT vs PH-UCT choice
         self.task_type = task_type  # Store task type (folding vs inverse_folding)
-        self.exclude_proteinmpnn = exclude_proteinmpnn  # Store ProteinMPNN exclusion flag
+        # Automatically exclude ProteinMPNN for folding tasks
+        self.exclude_proteinmpnn = exclude_proteinmpnn or (task_type == "folding")
+        if task_type == "folding" and not exclude_proteinmpnn:
+            print(f"   🔧 Auto-excluding ProteinMPNN for folding task")
         self._last_structure_eval = None
         
         # Multi-expert rollout parameters
@@ -250,7 +263,7 @@ class GeneralMCTS:
         # Create root node with baseline structure context
         root = MCTSNode(
             sequence=initial_sequence,
-            masked_positions=masked_positions,
+            mutable_positions=masked_positions,  # These are the low-confidence positions
             depth=0,
             plddt_scores=initial_plddt,
             reward=root_reward_value,
@@ -491,14 +504,20 @@ class GeneralMCTS:
                 candidate['sequence'], child_plddt, depth=node.depth + 1
             )
             
+            # CORRECT FIX: Child nodes should get the generated sequence for progress
+            # The masking consistency issue is about rollout generation, not child creation
+            # All rollouts at same depth use same parent node.sequence (which is correct)
+            # But child nodes should progress with generated sequences
+            generated_sequence = candidate['sequence']
+            
             child = MCTSNode(
-                sequence=candidate['sequence'],
-                masked_positions=child_masked_positions,
+                sequence=generated_sequence,  # Use generated sequence for progress
+                mutable_positions=child_masked_positions,  # New masking for next depth
                 parent=node,
                 depth=node.depth + 1,
                 plddt_scores=child_plddt,
                 entropy=candidate['entropy'],
-                novelty=self._compute_novelty(candidate['sequence'], node),
+                novelty=self._compute_novelty(generated_sequence, node),
                 expert_source=candidate['expert'],
                 reward=candidate['reward'],
                 visits=1,
@@ -736,9 +755,13 @@ class GeneralMCTS:
         elif depth == 2:
             threshold = 80.0  # Mask positions with pLDDT < 80
             target_ratio = 0.15  # Fallback: mask ~15% deeper
-        else:
+        elif depth == 3:
             threshold = 85.0  # Mask positions with pLDDT < 85
-            target_ratio = 0.10  # Fallback: mask ~10% at deeper depths
+            target_ratio = 0.05  # Fallback: mask ~5% at depth 3
+        elif depth >= 4:
+            # At max depth (4+), unmask all remaining X positions for 100% completion
+            threshold = 100.0  # No positions meet this threshold
+            target_ratio = 0.0   # Force complete unmasking
         
         # Method 1: Threshold-based masking (default)
         threshold_masked = set([i for i, score in enumerate(plddt_scores) if score < threshold])
@@ -842,6 +865,7 @@ class GeneralMCTS:
                     'plddt_scores': pl_ddt
                 }
             else:
+                # CRITICAL FIX: Create masked sequence for DPLM-2 input, but return COMPLETE sequence
                 masked_sequence = list(sequence)
                 for pos in masked_positions:
                     masked_sequence[pos] = 'X'
@@ -864,8 +888,18 @@ class GeneralMCTS:
                     masked_sequence=masked_seq_str,
                     temperature=1.0
                 )
+                
                 if generated_sequence and len(generated_sequence) == len(sequence) and all(c in 'ACDEFGHIKLMNPQRSTVWYX' for c in generated_sequence.upper()):
+                    # CRITICAL FIX: Use RAW DPLM output (complete sequence) for reward calculation
+                    # Store the complete generated sequence, track which positions were modified
+                    print(f"      ✅ Expert {expert_id} generated complete sequence (modified {len(masked_positions)} positions)")
+                    print(f"      🔍 Raw DPLM output (first 50): {generated_sequence[:50]}...")
+                    print(f"      🔍 Original sequence (first 50): {sequence[:50]}...")
+                    print(f"      🔍 Modified positions: {sorted(list(masked_positions))[:10]}...")
+                    
+                    # Return the COMPLETE sequence from DPLM (not partial with X's)
                     return {'sequence': generated_sequence}
+                
                 print(f"      ⚠️ Expert {expert_id} generated invalid sequence")
                 return None
         except Exception as e:
@@ -886,7 +920,7 @@ class GeneralMCTS:
             proteinmpnn_expert = self.dplm2_integration._load_expert(3)  # ProteinMPNN is expert 3
             
             # Use direct ProteinMPNN generation method (same as working script)
-            result = self.dplm2_integration._generate_with_proteinmpnn(
+            generated_sequence = self.dplm2_integration._generate_with_proteinmpnn(
                 proteinmpnn_model=proteinmpnn_expert,
                 aa_sequence=masked_seq_str,
                 struct_tokens="",  # Not used for ProteinMPNN
@@ -894,7 +928,16 @@ class GeneralMCTS:
                 temperature=1.0
             )
             
-            return result if result else None
+            if generated_sequence and len(generated_sequence) == len(sequence):
+                # CRITICAL FIX: Use RAW ProteinMPNN output (complete sequence) for reward calculation
+                print(f"      ✅ ProteinMPNN generated complete sequence (modified {len(masked_positions)} positions)")
+                print(f"      🔍 Raw ProteinMPNN output (first 50): {generated_sequence[:50]}...")
+                print(f"      🔍 Original sequence (first 50): {sequence[:50]}...")
+                
+                # Return the COMPLETE sequence from ProteinMPNN (not partial with X's)
+                return generated_sequence
+            
+            return None
             
         except Exception as e:
             print(f"      ⚠️ ProteinMPNN generation failed: {e}")
@@ -1144,6 +1187,11 @@ class GeneralMCTS:
         """Evaluate sequence using compound reward: R = 0.6×AAR + 0.35×scTM + 0.05×B"""
         if not self.reference_sequence or len(sequence) != len(self.reference_sequence):
             return 0.5
+        
+        # DEBUG: Show what sequence is being evaluated
+        print(f"   🔍 REWARD EVAL: Sequence (first 50): {sequence[:50]}...")
+        print(f"   🔍 REWARD EVAL: Reference (first 50): {self.reference_sequence[:50]}...")
+        print(f"   🔍 REWARD EVAL: Contains X's: {'X' in sequence}")
         
         # Calculate AAR (Amino Acid Recovery)
         matches = sum(1 for a, b in zip(sequence, self.reference_sequence) if a == b)

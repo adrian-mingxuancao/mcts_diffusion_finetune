@@ -8,6 +8,11 @@ These utilities provide a single source of truth for:
 
 Keeping the logic here ensures rollouts and final evaluations report consistent
 numbers regardless of where they are computed.
+
+IMPORTANT: For folding tasks, we use:
+- RMSD with optimal superimposition (Kabsch algorithm via OpenFold)
+- TM-score with optimal alignment (tm_align from tmtools)
+- Reward based ONLY on TM-score (no AAR since sequence is fixed)
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import numpy as np
+import torch
 
 
 def _extract_ca_coordinates(coords: np.ndarray) -> np.ndarray:
@@ -101,15 +107,63 @@ def calculate_biophysical_score(sequence: str) -> float:
         return 0.8
 
 
-def calculate_folding_reward(tm_score: float, sequence: str, aar: float = 1.0) -> float:
+def calculate_folding_reward(
+    tm_score: float, 
+    rmsd: float = None,
+    plddt: float = None,
+    sequence: str = "", 
+    aar: float = 1.0
+) -> float:
     """
-    Composite folding reward aligned with evaluation scripts.
+    Folding reward combining TM-score, RMSD, and pLDDT.
     
-    Reward weights mirror the sampling and analysis utilities:
-        R = 0.4 * AAR + 0.45 * TM-score + 0.15 * biophysical score
+    Formula: R_fold = α·TM + β·(1 - min(RMSD/10, 1)) + γ·pLDDT
+    
+    Default weights (if all components available):
+        α = 0.4 (TM-score weight)
+        β = 0.3 (RMSD weight)
+        γ = 0.3 (pLDDT weight)
+    
+    If pLDDT not available: α=0.6, β=0.4, γ=0
+    If RMSD not available: α=0.7, β=0, γ=0.3
+    If only TM available: α=1.0, β=0, γ=0
+    
+    For FOLDING tasks:
+        - Sequence is FIXED (given as input)
+        - AAR is always 1.0 (not being optimized)
+        - Reward based on structure quality (TM, RMSD, pLDDT)
     """
-    biophysical = calculate_biophysical_score(sequence)
-    reward = 0.4 * aar + 0.45 * tm_score + 0.15 * biophysical
+    # TM-score component (always available)
+    tm_component = float(np.clip(tm_score, 0.0, 1.0))
+    
+    # RMSD component (lower is better, normalize to 0-1 range)
+    rmsd_component = 0.0
+    if rmsd is not None and rmsd != float('inf'):
+        # 1 - min(RMSD/10, 1): RMSD=0 gives 1.0, RMSD>=10 gives 0.0
+        rmsd_component = 1.0 - min(rmsd / 10.0, 1.0)
+    
+    # pLDDT component (already in 0-100 range, normalize to 0-1)
+    plddt_component = 0.0
+    if plddt is not None:
+        plddt_component = float(np.clip(plddt / 100.0, 0.0, 1.0))
+    
+    # Adaptive weighting based on available components
+    if rmsd is not None and plddt is not None:
+        # All components available
+        alpha, beta, gamma = 0.4, 0.3, 0.3
+        reward = alpha * tm_component + beta * rmsd_component + gamma * plddt_component
+    elif rmsd is not None:
+        # TM and RMSD available
+        alpha, beta = 0.6, 0.4
+        reward = alpha * tm_component + beta * rmsd_component
+    elif plddt is not None:
+        # TM and pLDDT available
+        alpha, gamma = 0.7, 0.3
+        reward = alpha * tm_component + gamma * plddt_component
+    else:
+        # Only TM available (fallback)
+        reward = tm_component
+    
     return float(np.clip(reward, 0.0, 1.0))
 
 
@@ -122,6 +176,10 @@ def evaluate_folding_metrics(
     """
     Compute RMSD, TM-score, and composite reward for folding.
     
+    Uses official evaluation methods:
+    - RMSD: Optimal superimposition (Kabsch algorithm)
+    - TM-score: Optimal alignment (tm_align from tmtools)
+    
     Returns:
         (rmsd_angstrom, tm_score, composite_reward)
     """
@@ -130,16 +188,52 @@ def evaluate_folding_metrics(
     
     min_len = min(len(pred_ca), len(ref_ca))
     if min_len == 0:
-        return float("inf"), 0.0, calculate_folding_reward(0.0, sequence or "", aar)
+        return float("inf"), 0.0, calculate_folding_reward(0.0, rmsd=None, plddt=None)
     
     pred_trimmed = pred_ca[:min_len]
     ref_trimmed = ref_ca[:min_len]
     
-    diffs = pred_trimmed - ref_trimmed
-    rmsd = float(np.sqrt(np.mean(np.sum(diffs ** 2, axis=1))))
-    distances = np.sqrt(np.sum(diffs ** 2, axis=1))
-    tm_score = _compute_tm_score(distances, min_len)
-    reward = calculate_folding_reward(tm_score, sequence or "", aar)
+    try:
+        # Use OpenFold's superimpose for RMSD (with optimal alignment)
+        from openfold.utils.superimposition import superimpose
+        
+        pred_tensor = torch.tensor(pred_trimmed, dtype=torch.float32)[None]  # [1, L, 3]
+        ref_tensor = torch.tensor(ref_trimmed, dtype=torch.float32)[None]    # [1, L, 3]
+        mask = torch.ones(min_len, dtype=torch.bool)
+        
+        _, rmsd_tensor = superimpose(pred_tensor, ref_tensor, mask)
+        rmsd = float(rmsd_tensor.item())
+    except Exception as e:
+        print(f"   ⚠️ Superimpose failed, using unaligned RMSD: {e}")
+        # Fallback to unaligned RMSD
+        diffs = pred_trimmed - ref_trimmed
+        rmsd = float(np.sqrt(np.mean(np.sum(diffs ** 2, axis=1))))
+    
+    try:
+        # Use tmtools for TM-score (with optimal alignment)
+        from tmtools import tm_align
+        
+        # tm_align expects (L, 3, 3) for backbone atoms, but we only have CA
+        # Create dummy backbone with CA at position 1
+        pred_bb = np.zeros((min_len, 3, 3), dtype=np.float64)
+        ref_bb = np.zeros((min_len, 3, 3), dtype=np.float64)
+        pred_bb[:, 1, :] = pred_trimmed  # CA at index 1
+        ref_bb[:, 1, :] = ref_trimmed
+        
+        # Create dummy sequence (tm_align needs it but we only care about structure)
+        dummy_seq = "A" * min_len
+        
+        tm_results = tm_align(pred_bb, ref_bb, dummy_seq, dummy_seq)
+        tm_score = float(tm_results.tm_norm_chain1)  # TM-score normalized by chain 1 length
+    except Exception as e:
+        print(f"   ⚠️ tm_align failed, using simple TM-score: {e}")
+        # Fallback to simple TM-score calculation
+        distances = np.sqrt(np.sum((pred_trimmed - ref_trimmed) ** 2, axis=1))
+        tm_score = _compute_tm_score(distances, min_len)
+    
+    # Calculate composite reward with TM-score and RMSD
+    # Note: pLDDT not available from this evaluator (would need ESMFold output)
+    reward = calculate_folding_reward(tm_score, rmsd=rmsd, plddt=None)
     
     return rmsd, tm_score, reward
 
