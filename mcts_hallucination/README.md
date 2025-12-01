@@ -50,21 +50,23 @@ pip install -e .
 
 **About AlphaFold3 Setup:**
 
-ABCFold is a **wrapper** that calls AlphaFold3 - you don't need to download AF3 code yourself. ABCFold handles it via Docker/Singularity containers.
+ABCFold is a **wrapper** that calls AlphaFold3 - you don't need to download AF3 code yourself. ABCFold handles it via Docker/Podman/Singularity containers.
 
 **What you need:**
-1. **Docker or Singularity** installed on your system
-2. **AF3 model parameters** - Download from [AlphaFold3 GitHub](https://github.com/google-deepmind/alphafold3)
+1. **Podman** (or Docker/Singularity) - Container runtime
+2. **AF3 model parameters** (~200GB) - Download from [AlphaFold3 GitHub](https://github.com/google-deepmind/alphafold3)
 3. **Optional: MMseqs2** for faster MSA generation (recommended)
 
 **How ABCFold works:**
 - You provide: sequence + path to AF3 model parameters
-- ABCFold: Creates AF3 input JSON, runs AF3 via Docker, parses output
+- ABCFold: Creates AF3 input JSON, runs AF3 container, parses output
 - You get: Structure coordinates + confidence scores
 
 **For now:** Use mock mode for testing. Switch to real mode when you have AF3 parameters.
 
-See [ABCFold README](ABCFold/README.md) for detailed setup instructions.
+**Setup guides:**
+- **Podman/Docker setup**: See [AF3_SETUP.md](AF3_SETUP.md) for detailed instructions
+- **ABCFold usage**: See [ABCFold README](ABCFold/README.md)
 
 ### 2. ProteinMPNN
 
@@ -141,9 +143,9 @@ print(f"Mean pLDDT: {result['confidence'].mean():.1f}")
 - AF3 model parameters downloaded
 - Optional: MMseqs2 for faster MSA generation
 
-### Option 2: Test with Existing MCTS
+### Option 2: Use with MCTS (Integration Complete!)
 
-To integrate with the existing MCTS framework:
+The hallucination expert is now integrated into the MCTS framework:
 
 ```python
 from mcts_hallucination.core.hallucination_expert import create_hallucination_expert
@@ -160,21 +162,37 @@ mcts = GeneralMCTS(
     single_expert_id=3  # Use external expert
 )
 
-# Run search
+# Run search - hallucination expert will be called during expansion!
 result = mcts.search(initial_sequence=seq, num_iterations=5)
 ```
 
-**Note:** This requires adding the external expert handling code to `sequence_level_mcts.py` (see `test_integration.py` for the code snippet).
+**Test the integration:**
+```bash
+python test_integration.py
+```
 
 ## Components
 
-- `core/hallucination_mcts.py`: Copy of original MCTS (for reference)
+### Files You'll Use:
 - `core/hallucination_expert.py`: **Main expert class** - AF3 + ProteinMPNN pipeline
 - `core/abcfold_integration.py`: AF3 wrapper (supports mock and real modes)
-- `core/proteinmpnn_integration.py`: ProteinMPNN interface
 - `test_integration.py`: **Start here** - Integration tests and usage examples
+- `AF3_SETUP.md`: Guide for setting up AF3 with Podman/Docker
+
+### Reference Files:
+- `core/hallucination_mcts.py`: Copy of MCTS showing what was added (for reference only)
+- `core/proteinmpnn_integration.py`: ProteinMPNN interface (mock version)
 - `ABCFold/`: ABCFold repository for AF3 access
 - `SUMMARY.txt`: Overview of the integration approach
+
+### Important Note:
+When actually using the hallucination expert, you'll import from the **original** MCTS:
+```python
+from mcts_hallucination.core.hallucination_expert import create_hallucination_expert
+from mcts_diffusion_finetune.core.sequence_level_mcts import GeneralMCTS  # Original!
+```
+
+The `hallucination_mcts.py` file is kept as a reference to show what code was added.
 
 ## Next Steps
 

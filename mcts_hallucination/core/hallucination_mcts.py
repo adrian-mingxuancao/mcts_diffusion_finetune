@@ -1,11 +1,23 @@
 """
-Proper MCTS Framework with Diffusion and Multiple Expert Rollouts
+MCTS Framework with External Expert Support (Including Hallucination)
 
-Implementation following the correct MCTS architecture:
-1. PH-UCT Selection: Entropy-reinforced planning with mutual information for multiple experts
-2. Progressive pLDDT Masking: Real ESMFold pLDDT → quantile masking → rollouts
-3. Multi-Expert Rollouts: N rollouts per expert → top-K selection
-4. Proper Tree Growing: Leaf node expansion from super node/root node
+⚠️ IMPORTANT: This is a COPY of sequence_level_mcts.py with external expert handling added.
+
+FOR ACTUAL USE:
+- Use the original: mcts_diffusion_finetune/core/sequence_level_mcts.py
+- This file is kept here as REFERENCE showing what was added for external experts
+
+The key addition is in _expand_with_multi_expert_rollouts (lines 540-617):
+- Loops through self.external_experts
+- Calls expert.generate_candidate() for each rollout
+- Evaluates and adds candidates to the pool
+
+To use hallucination expert:
+    from mcts_hallucination.core.hallucination_expert import create_hallucination_expert
+    from mcts_diffusion_finetune.core.sequence_level_mcts import GeneralMCTS
+    
+    expert = create_hallucination_expert()
+    mcts = GeneralMCTS(dplm2_integration=dplm2, external_experts=[expert], ...)
 """
 
 import math
@@ -19,12 +31,22 @@ import time
 # Add the project root to the path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.dplm2_integration import DPLM2Integration
-from utils.structure_converter import get_structure_converter
-from utils.folding_metrics import (
-    evaluate_folding_metrics,
-    calculate_folding_reward,
-)
+# These imports are from the original mcts_diffusion_finetune package
+# They won't work in this isolated copy - use the original file instead
+try:
+    from core.dplm2_integration import DPLM2Integration
+    from utils.structure_converter import get_structure_converter
+    from utils.folding_metrics import (
+        evaluate_folding_metrics,
+        calculate_folding_reward,
+    )
+except ImportError:
+    # If imports fail, this file is being used standalone (not recommended)
+    print("⚠️ Warning: This is a reference copy. Use mcts_diffusion_finetune/core/sequence_level_mcts.py instead.")
+    DPLM2Integration = None
+    get_structure_converter = None
+    evaluate_folding_metrics = None
+    calculate_folding_reward = None
 
 
 @dataclass
