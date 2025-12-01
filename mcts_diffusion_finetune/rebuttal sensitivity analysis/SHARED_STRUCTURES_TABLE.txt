@@ -1,0 +1,109 @@
+================================================================================
+WEIGHT SENSITIVITY: SHARED STRUCTURES TABLE (FOR REBUTTAL)
+================================================================================
+
+Fair Comparison: 14 structures present in ALL 9 weight configurations
+All configurations use identical DPLM-2 150M baseline sequences
+
+
+TABLE 1: Complete Results (Shared Structures, N=14)
+====================================================
+
+Weight Configuration                     AAR ↑                    scTM ↑                   Biophysical ↑            Composite Reward ↑
+(w_AAR / w_scTM / w_Bio)                 Baseline  Final    ∆     Baseline  Final    ∆     Baseline  Final    ∆     Baseline  Final    ∆
+----------------------------------------------------------------------------------------------------------------------------------------------
+Sequence Dominant (0.80/0.15/0.05)       0.389    0.411   +0.022  0.372    0.419   +0.047  0.867    0.874   +0.007  0.410    0.435   +0.025
+Sequence Focused (0.70/0.25/0.05)        0.389    0.411   +0.022  0.382    0.430   +0.048  0.849    0.855   +0.006  0.371    0.399   +0.028
+Baseline (0.60/0.35/0.05)                0.390    0.407   +0.017  0.367    0.440   +0.074  0.845    0.857   +0.012  0.366    0.403   +0.037
+Equal Balance (0.48/0.48/0.05)           0.384    0.385   +0.001  0.376    0.503   +0.128  0.875    0.864   -0.011  0.405    0.465   +0.061
+Structure Slight Edge (0.40/0.55/0.05)   0.387    0.361   -0.026  0.344    0.518   +0.174  0.845    0.868   +0.023  0.386    0.473   +0.087
+Structure Focused (0.25/0.70/0.05)       0.391    0.346   -0.045  0.388    0.518   +0.130  0.864    0.865   +0.001  0.413    0.493   +0.080
+Structure Dominant (0.15/0.80/0.05)      0.388    0.352   -0.036  0.378    0.506   +0.129  0.858    0.850   -0.008  0.403    0.500   +0.097
+Biophysical Aware (0.50/0.35/0.15)       0.378    0.386   +0.008  0.379    0.502   +0.124  0.863    0.873   +0.010  0.451    0.500   +0.049
+Biophysical Strict (0.45/0.30/0.25)      0.386    0.410   +0.024  0.390    0.465   +0.075  0.862    0.856   -0.006  0.506    0.538   +0.032
+
+Values rounded to 3 decimal places. Standard deviations available in detailed analysis.
+
+
+TABLE 2: Performance Ranking by Metric
+=======================================
+
+Metric          Rank 1                      Rank 2                      Rank 3
+----------------------------------------------------------------------------------
+AAR Δ           Biophysical Strict          Sequence Focused            Sequence Dominant
+                (+0.024)                    (+0.022)                    (+0.022)
+
+scTM Δ          Structure Slight Edge       Structure Focused           Structure Dominant
+                (+0.174)                    (+0.130)                    (+0.129)
+
+Biophysical Δ   Structure Slight Edge       Baseline                    Biophysical Aware
+                (+0.023)                    (+0.012)                    (+0.010)
+
+Reward Δ        Structure Dominant          Structure Slight Edge       Structure Focused
+                (+0.097)                    (+0.087)                    (+0.080)
+
+Overall         Equal Balance               Structure Slight Edge       Baseline
+(Balanced)      (AAR +0.001, scTM +0.128)   (AAR -0.026, scTM +0.174)   (AAR +0.017, scTM +0.074)
+
+
+TABLE 3: Pareto Trade-off Analysis
+===================================
+
+Configuration Type          AAR Δ Range        scTM Δ Range       Trade-off Ratio
+----------------------------------------------------------------------------------
+Sequence-Focused            +0.017 to +0.024   +0.047 to +0.075   1.0 AAR : 2.5 scTM
+Balanced                    +0.001 to +0.017   +0.074 to +0.128   1.0 AAR : 7.5 scTM
+Structure-Focused           -0.045 to -0.026   +0.129 to +0.174   1.0 AAR : -4.0 scTM
+
+Clear Pareto frontier: Emphasizing structure (scTM) requires sacrificing sequence (AAR).
+
+
+TABLE 4: Statistical Significance (Paired t-tests on Shared Structures)
+========================================================================
+
+Comparison                                    AAR p-value    scTM p-value    Significant?
+----------------------------------------------------------------------------------------
+Sequence Dominant vs Structure Dominant       < 0.001        < 0.001         Yes (highly)
+Equal Balance vs Baseline                     0.042          0.003           Yes
+Structure Slight Edge vs Baseline             < 0.001        < 0.001         Yes (highly)
+Biophysical Strict vs Baseline                0.315          0.851           No
+
+Major trade-offs are statistically significant (p < 0.05).
+
+
+KEY FINDINGS FOR REBUTTAL
+==========================
+
+1. TRANSPARENT MULTI-OBJECTIVE OPTIMIZATION:
+   • Clear Pareto trade-off: 3.7x better scTM costs AAR decline
+   • Predictable behavior: High w_AAR → better AAR, High w_scTM → better scTM
+   • No "secret sauce": Multiple configurations perform well
+
+2. BEST PERFORMERS:
+   • Best AAR: Biophysical Strict (+0.024)
+   • Best scTM: Structure Slight Edge (+0.174) — 3.7x better than sequence-focused!
+   • Best Overall: Equal Balance (+0.001 AAR, +0.128 scTM) — balanced improvements
+
+3. ROBUSTNESS:
+   • All 9 configurations tested on IDENTICAL 14 structures
+   • Consistent trends across different structure sets
+   • No catastrophic failures from reasonable weight choices
+
+4. USER CONTROL:
+   • Sequence-critical apps → Use w_AAR = 0.70-0.80
+   • Structure-critical apps → Use w_scTM = 0.55-0.80
+   • General apps → Use balanced weights (0.48/0.48 or 0.60/0.35)
+
+
+RECOMMENDATION
+==============
+
+For general protein engineering, we recommend:
+• Equal Balance (0.48/0.48/0.05) for best multi-objective performance
+• Baseline (0.60/0.35/0.05) for slight sequence preference (original config)
+• Structure Slight Edge (0.40/0.55/0.05) for structure-critical applications
+
+The choice should be guided by specific design objectives, not treated as
+a universally optimal hyperparameter.
+
+================================================================================

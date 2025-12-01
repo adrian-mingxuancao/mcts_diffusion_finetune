@@ -1,9 +1,0 @@
-[
-  {
-    "structure_id": "5S9R",
-    "expert_id": 0,
-    "mode": "single_expert",
-    "success": false,
-    "error": "DPLM-2 integration is required"
-  }
-]

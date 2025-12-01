@@ -1,0 +1,117 @@
+HALLUCINATION MCTS INTEGRATION - SUMMARY
+=========================================
+
+WHAT WAS CREATED:
+-----------------
+
+1. core/hallucination_expert.py
+   - HallucinationExpert class that implements AF3 + ProteinMPNN pipeline
+   - Compatible with existing GeneralMCTS external_experts interface
+   - generate_candidate() method does: masked_seq → AF3 → structure → ProteinMPNN → sequence
+
+2. core/abcfold_integration.py
+   - ABCFoldIntegration wrapper for AF3 structure prediction
+   - Currently uses mock mode (needs real ABCFold API integration)
+   - Returns coordinates + confidence scores (pLDDT-like)
+
+3. core/proteinmpnn_integration.py
+   - Copied from original mcts_diffusion_finetune
+   - ProteinMPNN interface for inverse folding
+
+4. test_integration.py
+   - Standalone test for hallucination expert
+   - Shows integration example with MCTS
+   - Usage examples
+
+5. INTEGRATION_PATCH.md
+   - Exact code to add to sequence_level_mcts.py
+   - ~60 lines to enable external expert support
+   - Insert after line 538 in _expand_with_multi_expert_rollouts
+
+6. config/
+   - Copied configuration files from original
+
+KEY DIFFERENCES FROM DISCRETE DIFFUSION:
+-----------------------------------------
+
+DISCRETE DIFFUSION (DPLM):
+- Start with baseline sequence/structure
+- DPLM generates structure tokens
+- Mask based on pLDDT from DPLM/ESMFold
+- Token-based representation
+
+HALLUCINATION (AF3 + ProteinMPNN):
+- Start with masked sequence (X at low-confidence positions)
+- AF3 hallucinates structure from masked sequence
+- ProteinMPNN designs sequence from hallucinated structure
+- Coordinate-based representation
+
+HOW IT PLUGS INTO EXISTING MCTS:
+---------------------------------
+
+The existing GeneralMCTS is already model-agnostic:
+- Accepts external_experts list in constructor
+- Has ablation_mode for single/multi expert
+- Has _expand_with_multi_expert_rollouts for rollout generation
+
+What's needed:
+- Add ~60 lines to _expand_with_multi_expert_rollouts
+- Iterate through self.external_experts
+- Call expert.generate_candidate() for each rollout
+- Evaluate and add to candidate pool
+
+USAGE:
+------
+
+from mcts_hallucination.core.hallucination_expert import create_hallucination_expert
+
+# Create expert
+hallucination_expert = create_hallucination_expert()
+
+# Add to MCTS
+mcts = GeneralMCTS(
+    dplm2_integration=dplm2,
+    external_experts=[hallucination_expert],
+    ablation_mode="single_expert",
+    single_expert_id=3
+)
+
+# Run search
+result = mcts.search(initial_sequence=seq, num_iterations=5)
+
+NEXT STEPS:
+-----------
+
+1. Apply INTEGRATION_PATCH.md to sequence_level_mcts.py
+2. Implement real ABCFold API in abcfold_integration.py
+3. Test with: python test_integration.py
+4. Run full MCTS experiments
+
+FILES STRUCTURE:
+----------------
+
+mcts_hallucination/
+├── core/
+│   ├── __init__.py
+│   ├── hallucination_expert.py       [NEW - Main expert class]
+│   ├── abcfold_integration.py        [NEW - AF3 wrapper]
+│   └── proteinmpnn_integration.py    [COPIED - ProteinMPNN interface]
+├── config/                            [COPIED - Configuration files]
+├── utils/
+│   └── __init__.py
+├── external_models/
+│   └── __init__.py
+├── test_integration.py                [NEW - Integration tests]
+├── INTEGRATION_PATCH.md               [NEW - Code to add to MCTS]
+├── SUMMARY.txt                        [THIS FILE]
+└── README.md                          [Documentation]
+
+MINIMAL APPROACH:
+-----------------
+
+✓ Only copied necessary files from original
+✓ Created minimal new expert class
+✓ Reused existing MCTS infrastructure
+✓ No duplication of MCTS logic
+✓ Clean integration via external_experts interface
+✓ Backward compatible with existing code

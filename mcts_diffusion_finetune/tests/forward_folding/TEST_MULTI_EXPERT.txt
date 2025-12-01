@@ -1,0 +1,12 @@
+# Test Multi-Expert MCTS-PH (Config 5) - The most important one!
+
+srun --partition=general --gres=gpu:1 --cpus-per-task=4 --mem=32G --time=1:00:00 bash -c '
+export PATH="/net/scratch/caom/dplm_env/bin:$PATH"
+export PYTHONPATH=/home/caom/.cache/torch_extensions/py39_cu121/attn_core_inplace_cuda:$PYTHONPATH
+export HF_HOME=/net/scratch/caom/.cache/huggingface
+export TRANSFORMERS_CACHE=/net/scratch/caom/.cache/huggingface/transformers
+export TORCH_HOME=/net/scratch/caom/.cache/torch
+export TRITON_CACHE_DIR=/net/scratch/caom/.cache/triton
+cd /home/caom/AID3/dplm/mcts_diffusion_finetune/tests/forward_folding
+python test_mcts_folding_ablation.py 0 1 --mode multi_expert --num_iterations 5 --max_depth 5
+'
