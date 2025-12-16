@@ -62,7 +62,7 @@ ABCFold is a **wrapper** that calls AlphaFold3 - you don't need to download AF3 
 - ABCFold: Creates AF3 input JSON, runs AF3 container, parses output
 - You get: Structure coordinates + confidence scores
 
-**For now:** Use mock mode for testing. Switch to real mode when you have AF3 parameters.
+By default the hallucination expert now assumes real inference. Use mock mode only when explicitly testing (pass `use_mock=True` or `--use-mock`).
 
 **Setup guides:**
 - **Podman/Docker setup**: See [AF3_SETUP.md](AF3_SETUP.md) for detailed instructions
@@ -70,7 +70,22 @@ ABCFold is a **wrapper** that calls AlphaFold3 - you don't need to download AF3 
 
 ### 2. ProteinMPNN
 
-Already available in the denovo-protein-server directory. No additional installation needed.
+Set the `PROTEINMPNN_PATH` environment variable to the directory that contains `third_party/proteinpmnn` from your denovo-protein-server checkout. The expert will fail immediately if the real weights cannot be found.
+
+```bash
+export PROTEINMPNN_PATH=/lus/grand/projects/CompBioAffin/caom/denovo-protein-server/third_party/proteinpmnn
+```
+
+### 3. ESMFold Dependencies
+
+Install GPU-enabled PyTorch and transformers inside `.venv` so the ESMFold backend can download the `facebook/esmfold_v1` weights:
+
+```bash
+source .venv/bin/activate
+pip install --upgrade pip
+pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+pip install transformers==4.44.2
+```
 
 ## Usage
 
@@ -79,9 +94,15 @@ from mcts_hallucination.core.hallucination_mcts_simple import HallucinationMCTS
 from mcts_hallucination.core.abcfold_integration import ABCFoldIntegration
 from mcts_hallucination.core.proteinmpnn_integration import ProteinMPNNIntegration
 
-# Initialize integrations
-abcfold = ABCFoldIntegration()
-proteinmpnn = ProteinMPNNIntegration()
+# Initialize integrations in REAL mode
+abcfold = ABCFoldIntegration(
+    model_params="/path/to/af3_params",
+    use_mock=False,
+)
+proteinmpnn = ProteinMPNNIntegration(
+    use_real=True,
+    device="cuda",
+)
 
 # Initialize MCTS
 mcts = HallucinationMCTS(
@@ -100,6 +121,61 @@ result = mcts.search()
 print(f"Best sequence: {result.sequence}")
 print(f"Best structure quality: {result.reward}")
 ```
+
+### Switching Structure Backends
+
+The hallucination expert can fold structures with different engines:
+
+```python
+from mcts_hallucination.core.hallucination_expert import create_hallucination_expert
+
+# 1) ABCFold + Boltz (real Boltz predictions)
+boltz_expert = create_hallucination_expert(
+    structure_backend="abcfold",
+    abcfold_engine="boltz",
+)
+
+# 2) ABCFold + Chai-1
+chai_expert = create_hallucination_expert(
+    structure_backend="abcfold",
+    abcfold_engine="chai1",
+)
+
+# 3) Pure ESMFold (uses facebook/esmfold_v1 from HuggingFace)
+esmfold_expert = create_hallucination_expert(
+    structure_backend="esmfold",
+    esmfold_device="cuda",  # or "cpu" if needed
+)
+
+# 4) Enable the real ProteinMPNN inverse-folding model
+# (set $PROTEINMPNN_PATH to the directory containing third_party/proteinpmnn)
+real_mpnn_expert = create_hallucination_expert(
+    structure_backend="esmfold",
+    use_real_proteinmpnn=True,
+    proteinmpnn_device="cuda",
+)
+
+# Mock/testing mode (skip all real models)
+mock_expert = create_hallucination_expert(
+    use_mock=True,
+    use_real_proteinmpnn=False,
+)
+```
+
+When `abcfold_engine="af3"` (default) you must follow the official AlphaFold3 setup. For Boltz/Chai-1 you can skip AF3 weights and still use the ABCFold CLI. The ESMFold backend bypasses ABCFold entirely and relies on the HuggingFace `transformers` implementation. Real ProteinMPNN inverse folding is enabled by default (set `$PROTEINMPNN_PATH` accordingly); pass `use_real_proteinmpnn=False` or `--no-real-proteinmpnn` if you explicitly want to disable it. Mock mode is available only if you set both `use_mock=True` and `use_real_proteinmpnn=False`.
+
+### Hallucination Tree Demo
+
+Use `examples/hallucination_tree_branching_demo.py` to grow a small hallucination tree without running the full MCTS stack:
+
+```bash
+python examples/hallucination_tree_branching_demo.py \
+  --length 50 --depth 3 --branching 2 --mask_ratio 0.5 \
+  --structure-backend abcfold --abcfold-engine chai1 \
+  --output-json branching_nodes.json
+```
+
+Switch `--structure-backend` to `esmfold` (and install PyTorch + transformers in `.venv`) to run against the real HuggingFace model, or change `--abcfold-engine` to `boltz`/`chai1` for lighter ABCFold predictors. Real ProteinMPNN runs by default; pass `--no-real-proteinmpnn` (and/or `--use-mock`) only if you explicitly want synthetic inverse folding. Adjust `--depth`/`--branching` to control the total number of nodes and use `--refold-designed` plus `--output-json nodes.json` to capture validation stats for each node.
 
 ## Testing the Pipeline
 
@@ -152,7 +228,10 @@ from mcts_hallucination.core.hallucination_expert import create_hallucination_ex
 from mcts_diffusion_finetune.core.sequence_level_mcts import GeneralMCTS
 
 # Create hallucination expert
-hallucination_expert = create_hallucination_expert()
+hallucination_expert = create_hallucination_expert(
+    model_params="/path/to/af3_params",
+    use_real_proteinmpnn=True,
+)
 
 # Add to MCTS as external expert
 mcts = GeneralMCTS(

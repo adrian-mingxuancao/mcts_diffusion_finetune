@@ -12,24 +12,80 @@ import numpy as np
 from typing import Dict, Set, Optional, List
 import sys
 import os
+from pathlib import Path
 
 # Import the integrations
 from core.abcfold_integration import ABCFoldIntegration
+from core.esmfold_integration import ESMFoldIntegration
 
-# Simple ProteinMPNN wrapper for mock mode
+# Ensure the parent package (mcts_diffusion_finetune) is on sys.path so we can
+# reuse the real ProteinMPNN implementation when available.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+_REAL_PROTEINMPNN_ERROR = None
+try:
+    from mcts_diffusion_finetune.core.proteinmpnn_real import RealProteinMPNNExpert
+    REAL_PROTEINMPNN_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - best-effort import
+    RealProteinMPNNExpert = None
+    REAL_PROTEINMPNN_AVAILABLE = False
+    _REAL_PROTEINMPNN_ERROR = exc
+
+
 class ProteinMPNNIntegration:
-    """Simple ProteinMPNN wrapper for hallucination pipeline."""
-    def __init__(self, model_path: str = None):
-        self.model_path = model_path
-        print(f"🔧 ProteinMPNN Integration initialized (mock mode)")
+    """ProteinMPNN wrapper for the hallucination pipeline."""
     
-    def design_sequence(self, coordinates: np.ndarray) -> str:
-        """Design sequence from coordinates (mock mode)."""
-        # Mock: generate random sequence of same length
+    def __init__(
+        self,
+        use_real: bool = True,
+        device: str = "cuda",
+        temperature: float = 1.0,
+    ):
+        self.device = device
+        self.temperature = temperature
+        if use_real and not REAL_PROTEINMPNN_AVAILABLE:
+            raise ImportError(
+                "Real ProteinMPNN is not available. "
+                "Set the PROTEINMPNN_PATH environment variable to the directory "
+                "containing third_party/proteinpmnn and ensure dependencies are installed."
+            ) from _REAL_PROTEINMPNN_ERROR
+        self.use_real = use_real
+        self.real_expert: Optional[RealProteinMPNNExpert] = None
+        
+        if self.use_real:
+            try:
+                self.real_expert = RealProteinMPNNExpert(
+                    device=device,
+                    temperature=temperature,
+                )
+                self.real_expert.load_model()
+                print("🔧 ProteinMPNN Integration initialized (REAL MODE)")
+            except Exception as exc:
+                raise RuntimeError(f"Failed to initialize real ProteinMPNN: {exc}") from exc
+        
+        if not self.use_real:
+            print("🔧 ProteinMPNN Integration initialized (MOCK MODE)")
+    
+    def design_sequence(self, coordinates: np.ndarray, masked_sequence: Optional[str] = None) -> str:
+        """Design sequence from hallucinated coordinates."""
+        if self.use_real and self.real_expert is not None:
+            if masked_sequence is None:
+                raise ValueError("masked_sequence is required for real ProteinMPNN generation.")
+            sequences = self.real_expert.generate_sequences_from_coords(
+                masked_sequence=masked_sequence,
+                coords=coordinates,
+                num_samples=1,
+            )
+            if not sequences:
+                raise RuntimeError("Real ProteinMPNN failed to return a sequence.")
+            return sequences[0]
+        
+        # Mock fallback: generate random sequence of same length
         amino_acids = "ACDEFGHIKLMNPQRSTVWY"
         n = len(coordinates)
-        sequence = ''.join(np.random.choice(list(amino_acids), size=n))
-        return sequence
+        return ''.join(np.random.choice(list(amino_acids), size=n))
 
 
 class HallucinationExpert:
@@ -39,16 +95,64 @@ class HallucinationExpert:
     This can be added to GeneralMCTS.external_experts list.
     """
     
-    def __init__(self, model_params: str = None, use_mock: bool = True):
+    def __init__(
+        self,
+        model_params: str = None,
+        use_mock: bool = False,
+        structure_backend: str = "abcfold",
+        abcfold_engine: str = "af3",
+        abcfold_database_dir: str = None,
+        abcfold_use_mmseqs: bool = True,
+        esmfold_model_name: str = "facebook/esmfold_v1",
+        esmfold_device: str = "cuda",
+        esmfold_max_length: int = 1024,
+        use_real_proteinmpnn: bool = True,
+        proteinmpnn_device: str = "cuda",
+        proteinmpnn_temperature: float = 1.0,
+    ):
         """
         Initialize hallucination expert.
         
         Args:
             model_params: Path to AF3 model parameters (for real mode)
             use_mock: Use mock mode for testing (default: True)
+            structure_backend: "abcfold" or "esmfold"
+            abcfold_engine: Which ABCFold engine to run ("af3", "boltz", "chai1")
+            abcfold_database_dir: Optional AF3 database directory
+            abcfold_use_mmseqs: Whether to enable MMseqs2 flag for ABCFold
+            esmfold_model_name: HuggingFace identifier for ESMFold model
+            esmfold_device: Device for ESMFold inference ("cuda" or "cpu")
+            esmfold_max_length: Maximum ESMFold sequence length
+            use_real_proteinmpnn: Use the real ProteinMPNN inverse folding model
+            proteinmpnn_device: Device for ProteinMPNN inference
+            proteinmpnn_temperature: Sampling temperature for ProteinMPNN
         """
-        self.abcfold = ABCFoldIntegration(model_params=model_params, use_mock=use_mock)
-        self.proteinmpnn = ProteinMPNNIntegration()
+        self.structure_backend = structure_backend.lower()
+        if self.structure_backend == "abcfold":
+            self.structure_predictor = ABCFoldIntegration(
+                model_params=model_params,
+                database_dir=abcfold_database_dir,
+                use_mmseqs=abcfold_use_mmseqs,
+                use_mock=use_mock,
+                engine=abcfold_engine,
+            )
+            self.backend_label = f"ABCFold ({abcfold_engine.upper()})"
+        elif self.structure_backend == "esmfold":
+            self.structure_predictor = ESMFoldIntegration(
+                model_name=esmfold_model_name,
+                device=esmfold_device,
+                use_mock=use_mock,
+                max_length=esmfold_max_length,
+            )
+            self.backend_label = "ESMFold"
+        else:
+            raise ValueError(f"Unsupported structure backend '{structure_backend}'.")
+        
+        self.proteinmpnn = ProteinMPNNIntegration(
+            use_real=use_real_proteinmpnn,
+            device=proteinmpnn_device,
+            temperature=proteinmpnn_temperature,
+        )
         self.name = "hallucination"
         
         print(f"🔧 HallucinationExpert initialized")
@@ -91,21 +195,30 @@ class HallucinationExpert:
             masked_seq = self._create_masked_sequence(sequence, masked_positions)
             print(f"      🎭 Hallucination: {len(masked_positions)} positions masked")
             
-            # Step 2: AF3 hallucination
-            print(f"      🔮 AF3: Predicting structure...")
-            af3_result = self.abcfold.predict_structure(masked_seq)
-            hallucinated_coords = af3_result['coordinates']
-            confidence_scores = af3_result['confidence']
+            # Step 2: Structure hallucination
+            print(f"      🔮 {self.backend_label}: Predicting structure...")
+            structure_result = self.structure_predictor.predict_structure(masked_seq)
+            hallucinated_coords = structure_result['coordinates']
+            confidence_scores = structure_result['confidence']
             mean_plddt = np.mean(confidence_scores)
-            print(f"      ✅ AF3: Structure predicted (mean pLDDT: {mean_plddt:.1f})")
+            print(f"      ✅ {self.backend_label}: Structure predicted (mean pLDDT: {mean_plddt:.1f})")
             
             # Step 3: ProteinMPNN inverse folding
             print(f"      🧬 ProteinMPNN: Designing sequence...")
-            designed_sequence = self.proteinmpnn.design_sequence(hallucinated_coords)
+            designed_sequence = self.proteinmpnn.design_sequence(
+                hallucinated_coords,
+                masked_sequence=masked_seq,
+            )
             print(f"      ✅ ProteinMPNN: Sequence designed")
             
             # Step 4: Compute entropy from confidence variance
             entropy = self._compute_entropy(confidence_scores)
+            
+            pae_value = structure_result.get('pae_mean', 0.0)
+            if isinstance(pae_value, (float, int)) and not np.isnan(pae_value):
+                pae_mean = float(pae_value)
+            else:
+                pae_mean = 0.0
             
             return {
                 'sequence': designed_sequence,
@@ -115,7 +228,7 @@ class HallucinationExpert:
                 'expert': self.name,
                 'entropy': entropy,
                 'mean_plddt': mean_plddt,
-                'pae_mean': af3_result.get('pae_mean', 0.0)
+                'pae_mean': pae_mean
             }
             
         except Exception as e:
@@ -168,7 +281,12 @@ class HallucinationExpert:
         return 0.5
 
 
-def create_hallucination_expert(model_params: str = None, use_mock: bool = True) -> HallucinationExpert:
+def create_hallucination_expert(
+    model_params: str = None,
+    use_mock: bool = False,
+    structure_backend: str = "abcfold",
+    **kwargs,
+) -> HallucinationExpert:
     """
     Factory function to create hallucination expert.
     
@@ -194,4 +312,9 @@ def create_hallucination_expert(model_params: str = None, use_mock: bool = True)
             single_expert_id=3
         )
     """
-    return HallucinationExpert(model_params=model_params, use_mock=use_mock)
+    return HallucinationExpert(
+        model_params=model_params,
+        use_mock=use_mock,
+        structure_backend=structure_backend,
+        **kwargs,
+    )

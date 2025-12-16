@@ -22,7 +22,7 @@ def test_hallucination_expert_standalone():
     print("="*80 + "\n")
     
     # Create expert
-    expert = create_hallucination_expert()
+    expert = create_hallucination_expert(use_mock=True, use_real_proteinmpnn=False)
     
     # Test sequence
     test_sequence = "ACDEFGHIKLMNPQRSTVWY" * 3  # 60 residues
@@ -103,15 +103,18 @@ def show_usage_example():
     print("="*80 + "\n")
     
     print("""
-# 1. Create hallucination expert (mock mode for testing)
+# 1. Create hallucination expert (real mode)
 from mcts_hallucination.core.hallucination_expert import create_hallucination_expert
 
-hallucination_expert = create_hallucination_expert(use_mock=True)
+hallucination_expert = create_hallucination_expert(
+    model_params="/path/to/af3_params",
+    use_real_proteinmpnn=True,
+)
 
-# Or with real AF3 (when you have model parameters):
+# Mock/testing mode:
 # hallucination_expert = create_hallucination_expert(
-#     model_params="/path/to/af3_params",
-#     use_mock=False
+#     use_mock=True,
+#     use_real_proteinmpnn=False,
 # )
 
 # 2. Initialize MCTS with hallucination expert
@@ -137,10 +140,15 @@ result = mcts.search(
 
 # During tree expansion, the hallucination expert will:
 # - Take the current sequence with masked positions
-# - Run AF3 to hallucinate structure (mock or real)
+# - Run AF3 (or Boltz/Chai-1/ESMFold) to hallucinate structure (mock or real)
 # - Run ProteinMPNN to design sequence
 # - Return candidate for MCTS evaluation
 # - Compete with DPLM-2 and ProteinMPNN candidates
+
+# Alternative structure backends:
+# - Boltz: create_hallucination_expert(structure_backend="abcfold", abcfold_engine="boltz")
+# - Chai-1: create_hallucination_expert(structure_backend="abcfold", abcfold_engine="chai1")
+# - ESMFold: create_hallucination_expert(structure_backend="esmfold", esmfold_device="cuda")
     """)
 
 

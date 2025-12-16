@@ -52,23 +52,87 @@ The AF3 model parameters are available from Google DeepMind:
 4. Download size: ~200GB
 
 ```bash
-# Example download location
-mkdir -p /path/to/af3_params
-cd /path/to/af3_params
-# Follow official download instructions from GitHub
+# Work from the hallucination repo root
+cd /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination
+source .venv/bin/activate
+cd ABCFold
+
+# Decompress the AF3 weights that were downloaded as af3.bin.zst
+mkdir -p af3_params
+zstd -d af3.bin.zst -o af3_params/af3.bin
+
+# Record or print the absolute path for later use
+readlink -f af3_params
 ```
 
-### Step 4: Test ABCFold with Podman
+### Step 4: Clone the Official AlphaFold3 Repo and Build the Container
+
+Google DeepMind’s instructions (see `docs/installation.md` in the official repo) have you build the container locally:
 
 ```bash
-# Install ABCFold
-cd /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/ABCFold
+cd /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination
+git clone https://github.com/google-deepmind/alphafold3.git alphafold3_official
+cd alphafold3_official
+podman build -t alphafold3 -f docker/Dockerfile .
+```
+
+Replace `podman` with `docker` if that is your runtime. Once this finishes you will have a local image/tag named `alphafold3` that ABCFold can call.
+
+### Step 5: Download the AlphaFold3 Genetic Databases
+
+AlphaFold3 expects the full set of genetic databases described in the paper. The official repo provides `fetch_databases.sh` to download and unpack them (~630 GB uncompressed):
+
+```bash
+cd /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination/alphafold3_official
+./fetch_databases.sh /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination/alphafold3_databases
+```
+
+Keep the database directory outside the git checkout if you prefer a different location; just remember the absolute path so you can mount it when running AlphaFold3.
+
+### Step 6: (Optional) Prepare MMseqs2 Databases for ABCFold
+
+If you want to run MMseqs2 locally for faster MSAs inside ABCFold (instead of letting AF3 perform JACKHMMER searches), set up the databases using the helper script shipped with ABCFold:
+
+```bash
+cd /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination/ABCFold
+MMSEQS_NO_INDEX=1 ./setup_mmseqs_databases.sh /path/to/mmseqs_db
+```
+
+Point `--mmseqs_database /path/to/mmseqs_db` when running `abcfold` if you do not rely on the remote ColabFold server.
+
+### Step 7: Install and Test ABCFold with the Real Weights
+
+```bash
+cd /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination
+source .venv/bin/activate
+
+cd ABCFold
 pip install -e .
 
-# Test with example
+# Smoke test (run from inside ABCFold so relative paths resolve)
 abcfold examples/protein_example.json output_test -a --mmseqs2 \
-  --model_params /path/to/af3_params
+  --model_params af3_params
 ```
+
+If the command completes without errors and produces `output_test/model_0.cif`, the container runtime, AF3 weights, and MMseqs2 path are configured correctly.
+
+### Step 8: Using Boltz or Chai-1 Without AF3
+
+If AlphaFold3 is not available, you can still leverage the lighter models included with ABCFold:
+
+```bash
+cd /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination
+source .venv/bin/activate
+cd ABCFold
+
+# Boltz run
+abcfold examples/protein_example.json boltz_out -b --mmseqs2
+
+# Chai-1 run
+abcfold examples/protein_example.json chai_out -c --mmseqs2
+```
+
+These commands install Boltz/Chai-1 automatically—no AF3 weights or container builds required. In the hallucination expert, set `structure_backend="abcfold"` and `abcfold_engine="boltz"` (or `"chai1"`) with `use_mock=False` to read those predictions.
 
 ## Option 2: Using Singularity (Alternative for HPC)
 
@@ -100,6 +164,8 @@ result = abcfold.predict_structure("ACDEFGHIKLMNPQRSTVWY")
 print(f"Mean pLDDT: {result['confidence'].mean():.1f}")
 ```
 
+To bypass ABCFold entirely, instantiate the expert with `structure_backend="esmfold"` (optionally `esmfold_device="cuda"`) and ensure PyTorch plus `transformers` are installed so the HuggingFace `facebook/esmfold_v1` weights can be downloaded.
+
 ## Troubleshooting
 
 ### Issue: "Cannot connect to Docker daemon"
@@ -118,13 +184,9 @@ sudo systemctl start podman
 podman system migrate
 ```
 
-### Issue: AF3 container download fails
+### Issue: AF3 container build fails
 
-**Solution:** The AF3 container is pulled automatically. If it fails:
-```bash
-# Manually pull the container
-podman pull ghcr.io/google-deepmind/alphafold3:latest
-```
+**Solution:** Inspect the build logs from `podman build -t alphafold3 -f docker/Dockerfile .` inside the official repo. Common causes are insufficient disk space, missing CUDA 12.6 on the host, or network hiccups while installing dependencies. Rerun the build after fixing the underlying issue.
 
 ### Issue: Out of memory
 
@@ -133,20 +195,24 @@ podman pull ghcr.io/google-deepmind/alphafold3:latest
 ## Quick Reference
 
 ### File Locations
-- **ABCFold**: `/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/ABCFold`
-- **Model params**: Download from https://github.com/google-deepmind/alphafold3
+- **Project root**: `/lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination`
+- **ABCFold**: `/lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination/ABCFold`
+- **Model params**: `/lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination/ABCFold/af3_params`
 - **ABCFold README**: `ABCFold/README.md`
 
 ### Key Commands
 ```bash
-# Install ABCFold
+# Activate env and install ABCFold
+cd /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination
+source .venv/bin/activate
 cd ABCFold && pip install -e .
 
 # Run with MMseqs2 (recommended)
-abcfold input.json output -a --mmseqs2 --model_params /path/to/params
+abcfold input.json output -a --mmseqs2 --model_params /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination/ABCFold/af3_params
 
-# Run with Singularity
-abcfold input.json output -a --sif_path /path/to/af3.sif --model_params /path/to/params
+# Run with Singularity (after building alphafold3.sif from the official repo)
+abcfold input.json output -a --sif_path /path/to/alphafold3.sif \
+  --model_params /lus/grand/projects/CompBioAffin/caom/mcts_diffusion_finetune/mcts_hallucination/ABCFold/af3_params
 ```
 
 ### For Mock Mode (Testing)

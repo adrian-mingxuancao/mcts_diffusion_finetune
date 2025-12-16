@@ -13,12 +13,21 @@ import torch
 import tempfile
 from typing import List, Optional, Dict, Any
 
-# Add ProteinMPNN path
-proteinmpnn_path = "/home/caom/AID3/dplm/denovo-protein-server/third_party/proteinpmnn"
-sys.path.insert(0, proteinmpnn_path)
+# Add ProteinMPNN path (allow override via PROTEINMPNN_PATH env var)
+DEFAULT_PROTEINMPNN_PATH = "/home/caom/AID3/dplm/denovo-protein-server/third_party/proteinpmnn"
+proteinmpnn_path = os.environ.get("PROTEINMPNN_PATH", DEFAULT_PROTEINMPNN_PATH)
 
-# Import real ProteinMPNN
-from protein_mpnn_utils import ProteinMPNN, parse_PDB, StructureDatasetPDB, tied_featurize, _S_to_seq
+if proteinmpnn_path and proteinmpnn_path not in sys.path:
+    sys.path.insert(0, proteinmpnn_path)
+
+try:
+    from protein_mpnn_utils import ProteinMPNN, parse_PDB, StructureDatasetPDB, tied_featurize, _S_to_seq
+except ImportError as e:
+    raise ImportError(
+        f"Unable to import ProteinMPNN utilities. "
+        f"Set PROTEINMPNN_PATH to the directory containing third_party/proteinpmnn "
+        f"(current value: '{proteinmpnn_path}')."
+    ) from e
 
 class RealProteinMPNNExpert:
     """
