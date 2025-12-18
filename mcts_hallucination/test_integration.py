@@ -3,16 +3,476 @@ Test integration of hallucination expert with existing MCTS.
 
 This demonstrates how to plug the AF3+ProteinMPNN hallucination expert
 into the existing GeneralMCTS framework.
+
+NEW: Hallucination Design MCTS
+- Start from random/all-masked sequence
+- Iterate: ESMFold (seq→struct) → ProteinMPNN (struct→seq)
+- Q-value = convergence (similarity to parent)
+- Goal: converge to a stable sequence-structure pair
 """
 
 import sys
 import os
+import json
+import numpy as np
+import random
+import math
+from typing import Dict, List, Optional, Set
+from dataclasses import dataclass, field
+from datetime import datetime
 
 # Add paths
 sys.path.insert(0, '/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_diffusion_finetune')
 sys.path.insert(0, '/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination')
 
 from core.hallucination_expert import create_hallucination_expert
+from core.esmfold_integration import ESMFoldIntegration
+
+
+# ============================================================================
+# HALLUCINATION MCTS NODE
+# ============================================================================
+
+@dataclass
+class HallucinationNode:
+    """Node for hallucination MCTS - stores sequence-structure pair."""
+    sequence: str
+    coordinates: Optional[np.ndarray] = None
+    plddt_scores: Optional[np.ndarray] = None
+    mean_plddt: float = 0.0
+    
+    # MCTS fields
+    parent: Optional['HallucinationNode'] = None
+    children: List['HallucinationNode'] = field(default_factory=list)
+    visits: int = 0
+    total_reward: float = 0.0
+    depth: int = 0
+    
+    # Convergence tracking
+    convergence_score: float = 0.0  # How similar to parent (higher = more converged)
+    
+    def get_reward(self) -> float:
+        """Average reward from visits."""
+        return self.total_reward / max(1, self.visits)
+    
+    def uct_score(self, exploration_constant: float = 1.414) -> float:
+        """UCT score for selection."""
+        if self.visits == 0:
+            return float('inf')
+        
+        exploitation = self.get_reward()
+        if self.parent and self.parent.visits > 0:
+            exploration = exploration_constant * math.sqrt(math.log(self.parent.visits) / self.visits)
+        else:
+            exploration = 0
+        
+        return exploitation + exploration
+
+
+# ============================================================================
+# HALLUCINATION MCTS
+# ============================================================================
+
+class HallucinationMCTS:
+    """
+    MCTS for hallucination design using ESMFold + ProteinMPNN.
+    
+    Pipeline per node expansion:
+    1. Take current sequence
+    2. ESMFold: sequence → structure (coordinates + pLDDT)
+    3. ProteinMPNN: structure → new sequence
+    4. Q-value = convergence (similarity to parent sequence)
+    
+    Goal: Find a converged sequence-structure pair.
+    """
+    
+    def __init__(
+        self,
+        sequence_length: int = 50,
+        max_depth: int = 10,
+        num_iterations: int = 20,
+        num_rollouts: int = 2,
+        exploration_constant: float = 1.414,
+        use_mock: bool = False,
+        device: str = "cuda",
+    ):
+        self.sequence_length = sequence_length
+        self.max_depth = max_depth
+        self.num_iterations = num_iterations
+        self.num_rollouts = num_rollouts
+        self.exploration_constant = exploration_constant
+        self.use_mock = use_mock
+        self.device = device
+        
+        # Initialize ESMFold
+        print(f"🔧 Initializing ESMFold (mock={use_mock})...")
+        self.esmfold = ESMFoldIntegration(
+            device=device,
+            use_mock=use_mock,
+        )
+        
+        # Initialize ProteinMPNN (via hallucination expert for simplicity)
+        print(f"🔧 Initializing ProteinMPNN (mock={use_mock})...")
+        self.hallucination_expert = create_hallucination_expert(
+            structure_backend="esmfold",
+            esmfold_device=device,
+            use_mock=use_mock,
+            use_real_proteinmpnn=not use_mock,
+        )
+        
+        print(f"✅ HallucinationMCTS initialized")
+        print(f"   Sequence length: {sequence_length}")
+        print(f"   Max depth: {max_depth}")
+        print(f"   Iterations: {num_iterations}")
+        print(f"   Rollouts per expansion: {num_rollouts}")
+    
+    def generate_random_sequence(self, length: int) -> str:
+        """Generate a random amino acid sequence."""
+        amino_acids = "ACDEFGHIKLMNPQRSTVWY"
+        return ''.join(random.choice(amino_acids) for _ in range(length))
+    
+    def compute_sequence_similarity(self, seq1: str, seq2: str) -> float:
+        """Compute sequence identity between two sequences."""
+        if len(seq1) != len(seq2):
+            return 0.0
+        matches = sum(1 for a, b in zip(seq1, seq2) if a == b)
+        return matches / len(seq1)
+    
+    def compute_sibling_convergence(self, sequences: List[str]) -> float:
+        """
+        Compute convergence as average pairwise similarity among sibling sequences.
+        
+        Higher value = siblings are more similar = structure is more "deterministic"
+        in producing sequences = better convergence.
+        """
+        if len(sequences) < 2:
+            return 0.0
+        
+        total_sim = 0.0
+        num_pairs = 0
+        for i in range(len(sequences)):
+            for j in range(i + 1, len(sequences)):
+                total_sim += self.compute_sequence_similarity(sequences[i], sequences[j])
+                num_pairs += 1
+        
+        return total_sim / num_pairs if num_pairs > 0 else 0.0
+    
+    def compute_convergence_reward(self, sibling_convergence: float, plddt: float) -> float:
+        """
+        Compute reward based on sibling convergence and structure quality.
+        
+        Higher reward = siblings more similar (structure is consistent) + good pLDDT.
+        
+        R = 0.6 * sibling_convergence + 0.4 * normalized_plddt
+        """
+        normalized_plddt = plddt / 100.0  # pLDDT is 0-100
+        
+        reward = 0.6 * sibling_convergence + 0.4 * normalized_plddt
+        return reward
+    
+    def expand_node(self, node: HallucinationNode) -> List[HallucinationNode]:
+        """
+        Expand a node by running ESMFold → ProteinMPNN cycle.
+        
+        Convergence is measured by sibling similarity: how similar are the
+        sequences generated from the same structure? Higher sibling similarity
+        means the structure consistently produces similar sequences.
+        
+        Returns list of child nodes.
+        """
+        # Step 1: ESMFold - predict structure from current sequence (once for all rollouts)
+        print(f"      🔮 ESMFold predicting structure from: {node.sequence[:30]}...")
+        structure_result = self.esmfold.predict_structure(node.sequence)
+        coords = structure_result['coordinates']
+        parent_plddt = structure_result['confidence']
+        parent_mean_plddt = float(np.mean(parent_plddt))
+        print(f"      ✅ ESMFold done - mean pLDDT={parent_mean_plddt:.1f}, min={np.min(parent_plddt):.1f}, max={np.max(parent_plddt):.1f}")
+        
+        # Step 2: Generate multiple sequences from the SAME structure (siblings)
+        sibling_sequences = []
+        sibling_data = []  # Store (sequence, coords, plddt) for each sibling
+        
+        for rollout in range(self.num_rollouts):
+            try:
+                print(f"      🧬 Rollout {rollout+1}: ProteinMPNN designing sequence from structure...")
+                masked_seq = 'X' * len(node.sequence)
+                new_sequence = self.hallucination_expert.proteinmpnn.design_sequence(
+                    coordinates=coords,
+                    masked_sequence=masked_seq,
+                )
+                print(f"      ✅ Rollout {rollout+1}: ProteinMPNN done - new seq: {new_sequence[:30]}...")
+                
+                # Evaluate the new sequence with ESMFold
+                print(f"      🔮 Rollout {rollout+1}: ESMFold evaluating new sequence...")
+                new_structure_result = self.esmfold.predict_structure(new_sequence)
+                new_coords = new_structure_result['coordinates']
+                new_plddt = new_structure_result['confidence']
+                new_mean_plddt = float(np.mean(new_plddt))
+                print(f"      ✅ Rollout {rollout+1}: New seq pLDDT={new_mean_plddt:.1f}")
+                
+                sibling_sequences.append(new_sequence)
+                sibling_data.append((new_sequence, new_coords, new_plddt, new_mean_plddt))
+                
+            except Exception as e:
+                print(f"      ❌ Rollout {rollout+1} failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Step 3: Compute sibling convergence (how similar are siblings to each other)
+        sibling_convergence = self.compute_sibling_convergence(sibling_sequences)
+        print(f"      👥 Sibling convergence: {sibling_convergence:.3f} (from {len(sibling_sequences)} siblings)")
+        
+        # Step 4: Create child nodes with sibling convergence as the convergence score
+        children = []
+        for i, (seq, new_coords, new_plddt, new_mean_plddt) in enumerate(sibling_data):
+            # Reward based on sibling convergence + individual pLDDT
+            reward = self.compute_convergence_reward(sibling_convergence, new_mean_plddt)
+            
+            child = HallucinationNode(
+                sequence=seq,
+                coordinates=new_coords,
+                plddt_scores=new_plddt,
+                mean_plddt=new_mean_plddt,
+                parent=node,
+                depth=node.depth + 1,
+                convergence_score=sibling_convergence,  # All siblings share same convergence
+                visits=1,
+                total_reward=reward,
+            )
+            children.append(child)
+            
+            print(f"      📊 Child {i+1}: sibling_conv={sibling_convergence:.3f}, pLDDT={new_mean_plddt:.1f}, reward={reward:.3f}")
+        
+        return children
+    
+    def select_node(self, root: HallucinationNode) -> HallucinationNode:
+        """UCT selection - traverse tree to find best node to expand."""
+        node = root
+        while node.children and node.depth < self.max_depth:
+            # Select child with highest UCT score
+            node = max(node.children, key=lambda c: c.uct_score(self.exploration_constant))
+        return node
+    
+    def backpropagate(self, node: HallucinationNode, reward: float):
+        """Backpropagate reward up the tree."""
+        current = node
+        while current is not None:
+            current.visits += 1
+            current.total_reward += reward
+            current = current.parent
+    
+    def search(self) -> HallucinationNode:
+        """
+        Run MCTS search for hallucination design.
+        
+        Returns the best converged node.
+        """
+        print("\n" + "="*80)
+        print("🚀 Starting Hallucination MCTS Search")
+        print("="*80)
+        
+        # Create root node with random sequence
+        random_seq = self.generate_random_sequence(self.sequence_length)
+        print(f"\n🌱 Root: Random sequence (length={len(random_seq)})")
+        print(f"   Sequence: {random_seq}")
+        
+        root = HallucinationNode(
+            sequence=random_seq,
+            depth=0,
+            visits=1,
+        )
+        
+        # Run MCTS iterations
+        best_node = root
+        best_convergence = 0.0
+        
+        for iteration in range(self.num_iterations):
+            print(f"\n🔄 Iteration {iteration + 1}/{self.num_iterations}")
+            
+            # Selection
+            selected = self.select_node(root)
+            print(f"   📍 Selected node at depth {selected.depth}")
+            
+            # Expansion (if not at max depth)
+            if selected.depth < self.max_depth:
+                children = self.expand_node(selected)
+                selected.children.extend(children)
+                
+                # Backpropagate for each child
+                for child in children:
+                    self.backpropagate(child, child.get_reward())
+                    
+                    # Track best converged node
+                    if child.convergence_score > best_convergence:
+                        best_convergence = child.convergence_score
+                        best_node = child
+                        print(f"   🏆 New best: convergence={best_convergence:.3f}, depth={child.depth}")
+            
+            # Check for convergence (>95% similarity)
+            if best_convergence > 0.95:
+                print(f"\n✅ Converged! Sequence similarity > 95%")
+                break
+        
+        return best_node
+    
+    def find_best_in_tree(self, root: HallucinationNode) -> HallucinationNode:
+        """Find the best node in the entire tree by convergence."""
+        best = root
+        best_score = root.convergence_score
+        
+        def traverse(node):
+            nonlocal best, best_score
+            if node.convergence_score > best_score:
+                best = node
+                best_score = node.convergence_score
+            for child in node.children:
+                traverse(child)
+        
+        traverse(root)
+        return best
+
+
+# ============================================================================
+# TEST FUNCTIONS
+# ============================================================================
+
+def test_hallucination_mcts(use_mock: bool = True, length: int = 50):
+    """
+    Test the hallucination MCTS design.
+    
+    Args:
+        use_mock: Use mock models for testing (faster)
+        length: Sequence length to test
+    """
+    print("\n" + "="*80)
+    print(f"Test: Hallucination MCTS Design (length={length}, mock={use_mock})")
+    print("="*80 + "\n")
+    
+    # Create MCTS
+    mcts = HallucinationMCTS(
+        sequence_length=length,
+        max_depth=5,
+        num_iterations=10,
+        num_rollouts=2,
+        use_mock=use_mock,
+    )
+    
+    # Run search
+    best_node = mcts.search()
+    
+    # Print results
+    print("\n" + "="*80)
+    print("📊 RESULTS")
+    print("="*80)
+    print(f"\n🏆 Best converged node:")
+    print(f"   Depth: {best_node.depth}")
+    print(f"   Sequence: {best_node.sequence}")
+    print(f"   Convergence: {best_node.convergence_score:.3f}")
+    print(f"   Mean pLDDT: {best_node.mean_plddt:.1f}")
+    print(f"   Visits: {best_node.visits}")
+    print(f"   Avg Reward: {best_node.get_reward():.3f}")
+    
+    # Trace path from root
+    print(f"\n📈 Path from root:")
+    path = []
+    node = best_node
+    while node is not None:
+        path.append(node)
+        node = node.parent
+    path.reverse()
+    
+    for i, n in enumerate(path):
+        if i == 0:
+            print(f"   Depth {n.depth}: {n.sequence[:30]}... (root)")
+        else:
+            print(f"   Depth {n.depth}: {n.sequence[:30]}... (conv={n.convergence_score:.3f}, pLDDT={n.mean_plddt:.1f})")
+    
+    return best_node, mcts, path
+
+
+def save_results_to_json(
+    mcts: HallucinationMCTS,
+    path: List[HallucinationNode],
+    output_path: str = "/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/branching_nodes.json"
+):
+    """
+    Save MCTS results to JSON file.
+    
+    Collects all nodes from the tree and saves them in the same format as existing branching_nodes.json.
+    """
+    nodes_data = []
+    node_id_map = {}  # Map node object to node_id
+    current_id = 0
+    
+    def collect_nodes(node: HallucinationNode, parent_id: Optional[int] = None):
+        nonlocal current_id
+        node_id = current_id
+        node_id_map[id(node)] = node_id
+        current_id += 1
+        
+        # Convert numpy arrays to lists for JSON serialization
+        coord_shape = None
+        if node.coordinates is not None:
+            coord_shape = list(node.coordinates.shape)
+        
+        plddt_list = None
+        if node.plddt_scores is not None:
+            if isinstance(node.plddt_scores, np.ndarray):
+                plddt_list = node.plddt_scores.tolist()
+            else:
+                plddt_list = list(node.plddt_scores)
+        
+        node_data = {
+            "node_id": node_id,
+            "parent_id": parent_id,
+            "depth": node.depth,
+            "sequence": node.sequence,
+            "mean_plddt": float(node.mean_plddt) if node.mean_plddt else None,
+            "sibling_convergence": float(node.convergence_score),
+            "visits": node.visits,
+            "total_reward": float(node.total_reward),
+            "avg_reward": float(node.get_reward()),
+            "coordinate_shape": coord_shape,
+            "plddt_scores": plddt_list,
+        }
+        nodes_data.append(node_data)
+        
+        # Recursively collect children
+        for child in node.children:
+            collect_nodes(child, node_id)
+    
+    # Find root node from path
+    root = path[0] if path else None
+    if root:
+        collect_nodes(root)
+    
+    # Add metadata
+    result = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "sequence_length": mcts.sequence_length,
+            "max_depth": mcts.max_depth,
+            "num_iterations": mcts.num_iterations,
+            "num_rollouts": mcts.num_rollouts,
+            "use_mock": mcts.use_mock,
+            "total_nodes": len(nodes_data),
+            "best_node_id": node_id_map.get(id(path[-1])) if path else None,
+            "best_convergence": float(path[-1].convergence_score) if path else 0.0,
+            "best_plddt": float(path[-1].mean_plddt) if path and path[-1].mean_plddt else None,
+        },
+        "nodes": nodes_data,
+        "best_path": [node_id_map.get(id(n)) for n in path] if path else [],
+    }
+    
+    # Save to JSON
+    with open(output_path, 'w') as f:
+        json.dump(result, f, indent=2)
+    
+    print(f"\n💾 Results saved to: {output_path}")
+    print(f"   Total nodes: {len(nodes_data)}")
+    print(f"   Best path: {result['best_path']}")
+    
+    return result
 
 
 def test_hallucination_expert_standalone():
@@ -153,24 +613,42 @@ result = mcts.search(
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Hallucination MCTS Test")
+    parser.add_argument("--test", choices=["mcts", "expert", "all"], default="mcts",
+                        help="Which test to run")
+    parser.add_argument("--length", type=int, default=50,
+                        help="Sequence length for MCTS test")
+    parser.add_argument("--real", action="store_true",
+                        help="Use real models (requires GPU)")
+    parser.add_argument("--iterations", type=int, default=10,
+                        help="Number of MCTS iterations")
+    args = parser.parse_args()
+    
     print("\n" + "="*80)
-    print("Hallucination Expert Integration Tests")
+    print("Hallucination Design Tests")
     print("="*80)
     
-    # Test 1: Standalone expert
-    success1 = test_hallucination_expert_standalone()
+    if args.test in ["mcts", "all"]:
+        # Test hallucination MCTS
+        print(f"\n🧪 Running Hallucination MCTS (length={args.length}, mock={not args.real})")
+        best_node, mcts, path = test_hallucination_mcts(use_mock=not args.real, length=args.length)
+        
+        # Save results to JSON
+        save_results_to_json(mcts, path)
+        print(f"\n✅ MCTS test completed!")
     
-    # Test 2: MCTS integration (shows what's needed)
-    success2 = test_hallucination_expert_with_mcts()
+    if args.test in ["expert", "all"]:
+        # Test standalone expert
+        success1 = test_hallucination_expert_standalone()
+        print(f"\nStandalone test: {'✅ PASS' if success1 else '❌ FAIL'}")
     
-    # Show usage
-    show_usage_example()
+    if args.test in ["expert", "all"]:
+        # Test MCTS integration
+        success2 = test_hallucination_expert_with_mcts()
+        print(f"Integration guide: {'✅ SHOWN' if success2 else '❌ FAIL'}")
     
     print("\n" + "="*80)
-    print("Summary")
-    print("="*80)
-    print(f"Standalone test: {'✅ PASS' if success1 else '❌ FAIL'}")
-    print(f"Integration guide: {'✅ SHOWN' if success2 else '❌ FAIL'}")
+    print("Done!")
     print("="*80 + "\n")
-    
-    sys.exit(0 if success1 else 1)

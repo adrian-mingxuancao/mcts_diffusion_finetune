@@ -141,9 +141,19 @@ class ESMFoldIntegration:
             return np.full((output["positions"].shape[-3],), 70.0)
         
         plddt = output["plddt"].detach().cpu().numpy()
-        if plddt.ndim > 1:
+        
+        # ESMFold returns pLDDT with shape [batch, seq_len, 37] (per-atom)
+        # We need per-residue, so take mean across atoms (axis=-1)
+        if plddt.ndim == 3:
+            # Shape: [batch, seq_len, 37] -> [seq_len]
+            plddt = plddt[0].mean(axis=-1)  # Average across 37 atoms
+        elif plddt.ndim == 2:
+            # Shape: [seq_len, 37] -> [seq_len]
+            plddt = plddt.mean(axis=-1)
+        elif plddt.ndim > 1:
             plddt = plddt.flatten()
         
+        # ESMFold returns pLDDT in 0-1 range, convert to 0-100
         if plddt.max() <= 1.5:
             plddt = plddt * 100.0
         

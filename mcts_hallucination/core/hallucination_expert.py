@@ -24,9 +24,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Add the mcts_diffusion_finetune/core directory directly to avoid __init__.py import chain
+CORE_DIR = REPO_ROOT / "mcts_diffusion_finetune" / "core"
+if str(CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(CORE_DIR))
+
 _REAL_PROTEINMPNN_ERROR = None
 try:
-    from mcts_diffusion_finetune.core.proteinmpnn_real import RealProteinMPNNExpert
+    # Import directly from the file to avoid circular imports via __init__.py
+    from proteinmpnn_real import RealProteinMPNNExpert
     REAL_PROTEINMPNN_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - best-effort import
     RealProteinMPNNExpert = None
