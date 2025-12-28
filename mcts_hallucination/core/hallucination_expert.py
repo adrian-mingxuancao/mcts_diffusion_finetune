@@ -6,6 +6,10 @@ This expert integrates AF3 (via ABCFold) + ProteinMPNN as a two-step process:
 2. ProteinMPNN designs sequence from hallucinated structure
 
 This plugs into the existing GeneralMCTS as a new expert type.
+
+Supported backends:
+- Structure: ABCFold (AF3/Boltz/Chai-1), ESMFold
+- Inverse Folding: ProteinMPNN, NA-MPNN (nucleic acids)
 """
 
 import numpy as np
@@ -17,6 +21,14 @@ from pathlib import Path
 # Import the integrations
 from core.abcfold_integration import ABCFoldIntegration
 from core.esmfold_integration import ESMFoldIntegration
+
+# Optional: Import NA-MPNN integration
+try:
+    from core.nampnn_integration import NAMPNNIntegration
+    NAMPNN_AVAILABLE = True
+except ImportError:
+    NAMPNNIntegration = None
+    NAMPNN_AVAILABLE = False
 
 # Ensure the parent package (mcts_diffusion_finetune) is on sys.path so we can
 # reuse the real ProteinMPNN implementation when available.
@@ -99,6 +111,18 @@ class HallucinationExpert:
     Expert that uses AF3 hallucination + ProteinMPNN inverse folding.
     
     This can be added to GeneralMCTS.external_experts list.
+    
+    Supported structure backends:
+    - "abcfold": ABCFold wrapper (AF3, Boltz, Chai-1)
+    - "esmfold": ESMFold from HuggingFace
+    
+    Supported inverse folding backends:
+    - "proteinmpnn": Standard ProteinMPNN (proteins only)
+    - "nampnn": NA-MPNN (supports DNA/RNA)
+    
+    Fallback behavior:
+    - If fallback_to_protein_mpnn=True and input is protein-only,
+      NA-MPNN will automatically fallback to ProteinMPNN for better performance.
     """
     
     def __init__(
@@ -106,6 +130,9 @@ class HallucinationExpert:
         model_params: str = None,
         use_mock: bool = False,
         structure_backend: str = "abcfold",
+        inverse_folding_backend: str = "proteinmpnn",
+        molecule_type: str = "protein",
+        fallback_to_protein_mpnn: bool = True,
         abcfold_engine: str = "af3",
         abcfold_database_dir: str = None,
         abcfold_use_mmseqs: bool = True,
@@ -115,14 +142,20 @@ class HallucinationExpert:
         use_real_proteinmpnn: bool = True,
         proteinmpnn_device: str = "cuda",
         proteinmpnn_temperature: float = 1.0,
+        nampnn_path: str = None,
+        nampnn_temperature: float = 0.1,
     ):
         """
         Initialize hallucination expert.
         
         Args:
             model_params: Path to AF3 model parameters (for real mode)
-            use_mock: Use mock mode for testing (default: True)
+            use_mock: Use mock mode for testing (default: False)
             structure_backend: "abcfold" or "esmfold"
+            inverse_folding_backend: "proteinmpnn" or "nampnn"
+            molecule_type: "protein", "dna", "rna", or "complex"
+            fallback_to_protein_mpnn: If True and using NA-MPNN, automatically
+                fallback to ProteinMPNN when input contains only protein chains
             abcfold_engine: Which ABCFold engine to run ("af3", "boltz", "chai1")
             abcfold_database_dir: Optional AF3 database directory
             abcfold_use_mmseqs: Whether to enable MMseqs2 flag for ABCFold
@@ -132,8 +165,16 @@ class HallucinationExpert:
             use_real_proteinmpnn: Use the real ProteinMPNN inverse folding model
             proteinmpnn_device: Device for ProteinMPNN inference
             proteinmpnn_temperature: Sampling temperature for ProteinMPNN
+            nampnn_path: Path to NA-MPNN repository
+            nampnn_temperature: Sampling temperature for NA-MPNN
         """
         self.structure_backend = structure_backend.lower()
+        self.inverse_folding_backend = inverse_folding_backend.lower()
+        self.molecule_type = molecule_type.lower()
+        self.use_mock = use_mock
+        self.fallback_to_protein_mpnn = fallback_to_protein_mpnn
+        
+        # Initialize structure predictor
         if self.structure_backend == "abcfold":
             self.structure_predictor = ABCFoldIntegration(
                 model_params=model_params,
@@ -152,16 +193,58 @@ class HallucinationExpert:
             )
             self.backend_label = "ESMFold"
         else:
-            raise ValueError(f"Unsupported structure backend '{structure_backend}'.")
+            raise ValueError(
+                f"Unsupported structure backend '{structure_backend}'. "
+                f"Choose from: abcfold, esmfold"
+            )
         
-        self.proteinmpnn = ProteinMPNNIntegration(
-            use_real=use_real_proteinmpnn,
-            device=proteinmpnn_device,
-            temperature=proteinmpnn_temperature,
-        )
+        # Initialize inverse folding backend
+        self._proteinmpnn_fallback = None  # For protein-only fallback
+        
+        if self.inverse_folding_backend == "proteinmpnn":
+            self.inverse_folder = ProteinMPNNIntegration(
+                use_real=use_real_proteinmpnn,
+                device=proteinmpnn_device,
+                temperature=proteinmpnn_temperature,
+            )
+            self.inverse_folder_label = "ProteinMPNN"
+        elif self.inverse_folding_backend == "nampnn":
+            if not NAMPNN_AVAILABLE:
+                raise ImportError(
+                    "NA-MPNN integration not available. "
+                    "Check that nampnn_integration.py exists and has no import errors."
+                )
+            self.inverse_folder = NAMPNNIntegration(
+                nampnn_path=nampnn_path,
+                use_mock=use_mock,
+                temperature=nampnn_temperature,
+            )
+            self.inverse_folder_label = "NA-MPNN"
+            
+            # Initialize ProteinMPNN fallback for protein-only cases
+            if self.fallback_to_protein_mpnn:
+                self._proteinmpnn_fallback = ProteinMPNNIntegration(
+                    use_real=use_real_proteinmpnn,
+                    device=proteinmpnn_device,
+                    temperature=proteinmpnn_temperature,
+                )
+        else:
+            raise ValueError(
+                f"Unsupported inverse folding backend '{inverse_folding_backend}'. "
+                f"Choose from: proteinmpnn, nampnn"
+            )
+        
+        # For backwards compatibility, also expose as self.proteinmpnn
+        self.proteinmpnn = self.inverse_folder
+        
         self.name = "hallucination"
         
         print(f"🔧 HallucinationExpert initialized")
+        print(f"   Structure: {self.backend_label}")
+        print(f"   Inverse Folding: {self.inverse_folder_label}")
+        print(f"   Molecule Type: {self.molecule_type}")
+        if self._proteinmpnn_fallback:
+            print(f"   Protein-only Fallback: ProteinMPNN")
     
     def get_name(self) -> str:
         """Return expert name."""
@@ -285,12 +368,41 @@ class HallucinationExpert:
         """
         # Default entropy for hallucination (medium uncertainty)
         return 0.5
+    
+    def is_protein_only(self, complex_input: "ComplexInput") -> bool:
+        """
+        Check if a ComplexInput contains only protein chains.
+        
+        Used to determine whether to fallback to ProteinMPNN.
+        """
+        from core.complex_input import ProteinChain
+        
+        for chain in complex_input.chains.values():
+            if not isinstance(chain, ProteinChain):
+                return False
+        return True
+    
+    def get_inverse_folder(self, complex_input: "ComplexInput" = None):
+        """
+        Get the appropriate inverse folder based on input composition.
+        
+        If fallback_to_protein_mpnn=True and input is protein-only,
+        returns ProteinMPNN. Otherwise returns the configured inverse folder.
+        """
+        if self._proteinmpnn_fallback and complex_input:
+            if self.is_protein_only(complex_input):
+                print("      📌 Protein-only input detected, using ProteinMPNN fallback")
+                return self._proteinmpnn_fallback
+        return self.inverse_folder
 
 
 def create_hallucination_expert(
     model_params: str = None,
     use_mock: bool = False,
     structure_backend: str = "abcfold",
+    inverse_folding_backend: str = "proteinmpnn",
+    molecule_type: str = "protein",
+    fallback_to_protein_mpnn: bool = True,
     **kwargs,
 ) -> HallucinationExpert:
     """
@@ -298,14 +410,28 @@ def create_hallucination_expert(
     
     Args:
         model_params: Path to AF3 model parameters (for real mode)
-        use_mock: Use mock mode for testing (default: True)
+        use_mock: Use mock mode for testing (default: False)
+        structure_backend: "abcfold" or "esmfold"
+        inverse_folding_backend: "proteinmpnn" or "nampnn"
+        molecule_type: "protein", "dna", "rna", or "complex"
+        fallback_to_protein_mpnn: When using NA-MPNN, fallback to 
+            ProteinMPNN for protein-only inputs (default: True)
     
     Usage:
-        # Mock mode (for testing)
-        hallucination_expert = create_hallucination_expert()
+        # Basic protein design (mock mode for testing)
+        expert = create_hallucination_expert(use_mock=True)
         
-        # Real mode (with AF3)
-        hallucination_expert = create_hallucination_expert(
+        # With ABCFold + NA-MPNN for DNA/RNA design (auto-fallback for protein-only)
+        expert = create_hallucination_expert(
+            structure_backend="abcfold",
+            inverse_folding_backend="nampnn",
+            molecule_type="complex",
+            fallback_to_protein_mpnn=True,
+            use_mock=True,
+        )
+        
+        # Real mode with AF3
+        expert = create_hallucination_expert(
             model_params="/path/to/af3/params",
             use_mock=False
         )
@@ -313,7 +439,7 @@ def create_hallucination_expert(
         # Add to MCTS
         mcts = GeneralMCTS(
             dplm2_integration=dplm2,
-            external_experts=[hallucination_expert],
+            external_experts=[expert],
             ablation_mode="single_expert",
             single_expert_id=3
         )
@@ -322,5 +448,8 @@ def create_hallucination_expert(
         model_params=model_params,
         use_mock=use_mock,
         structure_backend=structure_backend,
+        inverse_folding_backend=inverse_folding_backend,
+        molecule_type=molecule_type,
+        fallback_to_protein_mpnn=fallback_to_protein_mpnn,
         **kwargs,
     )
