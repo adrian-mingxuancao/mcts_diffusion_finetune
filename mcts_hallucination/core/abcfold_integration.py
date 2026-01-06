@@ -177,10 +177,14 @@ class ABCFoldIntegration:
             
             print(f"      ✅ Boltz prediction complete (mean pLDDT: {np.mean(confidence):.1f})")
             
+            # Convert CIF to PDB for downstream tools like NA-MPNN
+            pdb_path = self._cif_to_pdb(cif_files[0])
+            
             return {
                 'coordinates': coords,
                 'confidence': confidence,
-                'pae_mean': pae_mean
+                'pae_mean': pae_mean,
+                'structure_path': pdb_path,  # Full structure file for NA-MPNN
             }
     
     def _predict_chai(self, sequence: str, num_recycles: int) -> Dict:
@@ -339,31 +343,43 @@ class ABCFoldIntegration:
         Parse CIF file to extract coordinates and confidence.
         
         Returns:
-            coords: (N, 3) CA coordinates
+            coords: (N, 3) representative atom coordinates (CA for protein, C1' for NA)
             confidence: (N,) pLDDT scores
             pae_mean: Mean PAE
         """
-        # This is a simplified parser - you may want to use a proper CIF parser
-        # like gemmi or BioPython
         try:
             from Bio.PDB.MMCIFParser import MMCIFParser
-            from Bio.PDB import PDBIO
             
             parser = MMCIFParser(QUIET=True)
             structure = parser.get_structure("hallucination", cif_path)
             
-            # Extract CA coordinates
+            # Extract representative atom coordinates based on molecule type
+            # For protein: CA atom
+            # For nucleic acids: C1' atom
             coords = []
             confidence = []
+            
+            # Determine which atom to use based on molecule_type
+            if self.molecule_type == "protein":
+                target_atoms = ["CA"]
+            else:
+                # For DNA/RNA, use C1' as representative atom
+                target_atoms = ["C1'", "C1*"]  # C1* is alternative naming
             
             for model in structure:
                 for chain in model:
                     for residue in chain:
-                        if 'CA' in residue:
-                            ca = residue['CA']
-                            coords.append(ca.get_coord())
+                        # Try each target atom
+                        atom_found = None
+                        for atom_name in target_atoms:
+                            if atom_name in residue:
+                                atom_found = residue[atom_name]
+                                break
+                        
+                        if atom_found is not None:
+                            coords.append(atom_found.get_coord())
                             # pLDDT is stored in B-factor column
-                            confidence.append(ca.get_bfactor())
+                            confidence.append(atom_found.get_bfactor())
             
             coords = np.array(coords)
             confidence = np.array(confidence)
@@ -386,6 +402,33 @@ class ABCFoldIntegration:
                 mock = self._mock_predict("A" * sequence_length)
                 return mock['coordinates'], mock['confidence'], mock['pae_mean']
             raise RuntimeError(msg) from e
+    
+    def _cif_to_pdb(self, cif_path: Path) -> str:
+        """Convert CIF file to PDB format for downstream tools like NA-MPNN.
+        
+        Returns:
+            Path to the converted PDB file (persistent temp file)
+        """
+        try:
+            from Bio.PDB.MMCIFParser import MMCIFParser
+            from Bio.PDB import PDBIO
+            
+            parser = MMCIFParser(QUIET=True)
+            structure = parser.get_structure("structure", cif_path)
+            
+            # Save to a persistent temp file (not in the temp directory that will be deleted)
+            pdb_file = tempfile.NamedTemporaryFile(suffix='.pdb', delete=False)
+            pdb_path = pdb_file.name
+            pdb_file.close()
+            
+            io = PDBIO()
+            io.set_structure(structure)
+            io.save(pdb_path)
+            
+            return pdb_path
+        except Exception as e:
+            print(f"      Warning: CIF to PDB conversion failed: {e}")
+            return None
     
     def _mock_predict(self, sequence: str) -> Dict:
         """Mock structure prediction for testing."""

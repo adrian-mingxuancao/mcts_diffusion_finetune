@@ -295,10 +295,26 @@ class HallucinationExpert:
             
             # Step 3: Inverse folding (ProteinMPNN or NA-MPNN)
             print(f"      🧬 {self.inverse_folder_label}: Designing sequence...")
-            designed_sequence = self.inverse_folder.design_sequence(
-                hallucinated_coords,
-                masked_sequence=masked_seq,
-            )
+            
+            # Check if we have a structure file from ABCFold (for NA-MPNN)
+            structure_path = structure_result.get('structure_path')
+            if structure_path and hasattr(self.inverse_folder, 'design_sequence'):
+                # Use the actual structure file if available (better for NA-MPNN)
+                designed_sequence = self.inverse_folder.design_sequence(
+                    coordinates=hallucinated_coords,
+                    masked_sequence=masked_seq,
+                    pdb_path=structure_path,
+                )
+            else:
+                designed_sequence = self.inverse_folder.design_sequence(
+                    hallucinated_coords,
+                    masked_sequence=masked_seq,
+                )
+            
+            # Handle dict return from NA-MPNN
+            if isinstance(designed_sequence, dict):
+                designed_sequence = designed_sequence.get('sequences', [''])[0]
+            
             print(f"      ✅ {self.inverse_folder_label}: Sequence designed")
             
             # Step 4: Compute entropy from confidence variance
