@@ -3,6 +3,11 @@ ABCFold Integration for AlphaFold3 Structure Hallucination
 
 Wrapper around ABCFold (https://github.com/rigdenlab/ABCFold) for structure prediction
 from masked sequences in the hallucination pipeline.
+
+Supports:
+- AF3 via ABCFold CLI
+- Boltz via boltz CLI (with --no_kernels for compatibility)
+- Chai-1 via direct Python API (chai_lab.chai1)
 """
 
 import numpy as np
@@ -10,6 +15,7 @@ from typing import Dict, Optional, List
 import json
 import tempfile
 import subprocess
+import os
 from pathlib import Path
 
 
@@ -86,11 +92,147 @@ class ABCFoldIntegration:
     
     def _real_predict(self, sequence: str, num_recycles: int) -> Dict:
         """
-        Real ABCFold prediction using command-line interface.
+        Real prediction using the appropriate backend.
         
-        This runs ABCFold via subprocess and parses the output CIF file.
+        Routes to:
+        - Boltz: Direct CLI with --no_kernels flag
+        - Chai-1: Direct Python API
+        - AF3: ABCFold CLI
         """
-        # Create temporary directory for ABCFold run
+        if self.engine == "boltz":
+            return self._predict_boltz(sequence, num_recycles)
+        elif self.engine == "chai1":
+            return self._predict_chai(sequence, num_recycles)
+        else:
+            return self._predict_abcfold(sequence, num_recycles)
+    
+    def _predict_boltz(self, sequence: str, num_recycles: int) -> Dict:
+        """Run Boltz prediction directly via CLI."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            
+            # Create FASTA file in Boltz format: >CHAIN_ID|ENTITY_TYPE
+            fasta_path = tmpdir / "input.fasta"
+            with open(fasta_path, 'w') as f:
+                f.write(f">A|protein\n{sequence}\n")
+            
+            output_dir = tmpdir / "output"
+            
+            # Set cache directory to avoid home quota issues
+            env = os.environ.copy()
+            env['XDG_CACHE_HOME'] = '/net/scratch/caom/.cache'
+            env['HF_HOME'] = '/net/scratch/caom/.cache/huggingface'
+            env['TORCH_HOME'] = '/net/scratch/caom/.cache/torch'
+            
+            cmd = [
+                "boltz", "predict",
+                str(fasta_path),
+                "--out_dir", str(output_dir),
+                "--use_msa_server",
+                "--no_kernels",  # Required for CUDA compatibility
+                "--override",
+                "--recycling_steps", str(num_recycles),
+            ]
+            
+            print(f"      Running Boltz: {' '.join(cmd[:6])}...")
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            
+            if result.returncode != 0:
+                msg = f"Boltz failed: {result.stderr.strip()[-500:]}"
+                if self.allow_fallback:
+                    print(f"      {msg}\n      Falling back to mock output")
+                    return self._mock_predict(sequence)
+                raise RuntimeError(msg)
+            
+            # Find output files
+            cif_files = list(output_dir.glob("**/predictions/**/*.cif"))
+            plddt_files = list(output_dir.glob("**/predictions/**/plddt*.npz"))
+            
+            if not cif_files:
+                msg = "Boltz produced no CIF output."
+                if self.allow_fallback:
+                    print(f"      {msg}\n      Falling back to mock output")
+                    return self._mock_predict(sequence)
+                raise RuntimeError(msg)
+            
+            # Parse CIF for coordinates
+            coords, _, pae_mean = self._parse_cif(cif_files[0], len(sequence))
+            
+            # Get pLDDT from npz file if available
+            if plddt_files:
+                plddt_data = np.load(plddt_files[0])
+                confidence = plddt_data['plddt']
+                # Boltz returns pLDDT in 0-1 range, scale to 0-100
+                if confidence.max() <= 1.0:
+                    confidence = confidence * 100.0
+            else:
+                confidence = np.ones(len(sequence)) * 70.0
+            
+            print(f"      ✅ Boltz prediction complete (mean pLDDT: {np.mean(confidence):.1f})")
+            
+            return {
+                'coordinates': coords,
+                'confidence': confidence,
+                'pae_mean': pae_mean
+            }
+    
+    def _predict_chai(self, sequence: str, num_recycles: int) -> Dict:
+        """Run Chai-1 prediction via Python API."""
+        try:
+            from chai_lab.chai1 import run_inference
+        except ImportError as e:
+            msg = f"Chai-1 not available: {e}"
+            if self.allow_fallback:
+                print(f"      {msg}\n      Falling back to mock output")
+                return self._mock_predict(sequence)
+            raise ImportError(msg) from e
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            
+            # Create FASTA file in Chai format
+            fasta_path = tmpdir / "input.fasta"
+            with open(fasta_path, 'w') as f:
+                f.write(f">protein|name=hallucination\n{sequence}\n")
+            
+            output_dir = tmpdir / "output"
+            
+            print(f"      Running Chai-1 inference...")
+            
+            try:
+                candidates = run_inference(
+                    fasta_file=fasta_path,
+                    output_dir=output_dir,
+                    num_trunk_recycles=num_recycles,
+                    num_diffn_timesteps=50,  # Faster inference
+                    seed=42,
+                    device='cuda:0' if self._cuda_available() else 'cpu',
+                    use_esm_embeddings=False,
+                )
+                
+                # Parse the best structure
+                if candidates.cif_paths:
+                    coords, confidence, pae_mean = self._parse_cif(
+                        candidates.cif_paths[0], len(sequence)
+                    )
+                    print(f"      ✅ Chai-1 prediction complete (mean pLDDT: {np.mean(confidence):.1f})")
+                    return {
+                        'coordinates': coords,
+                        'confidence': confidence,
+                        'pae_mean': pae_mean
+                    }
+                else:
+                    raise RuntimeError("Chai-1 produced no structures")
+                    
+            except Exception as e:
+                msg = f"Chai-1 inference failed: {e}"
+                if self.allow_fallback:
+                    print(f"      {msg}\n      Falling back to mock output")
+                    return self._mock_predict(sequence)
+                raise RuntimeError(msg) from e
+    
+    def _predict_abcfold(self, sequence: str, num_recycles: int) -> Dict:
+        """Run AF3 prediction via ABCFold CLI."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
             
@@ -112,19 +254,16 @@ class ABCFoldIntegration:
             if self.use_mmseqs:
                 cmd.append("--mmseqs2")
             
-            # Only AF3 requires model/database paths and recycle controls
-            if self.engine == "af3":
-                if self.model_params:
-                    cmd.extend(["--model_params", self.model_params])
-                
-                if self.database_dir and not self.use_mmseqs:
-                    cmd.extend(["--database", self.database_dir])
-                
-                cmd.extend([
-                    "--num_recycles", str(num_recycles),
-                ])
+            if self.model_params:
+                cmd.extend(["--model_params", self.model_params])
             
-            cmd.extend(["--override", "--no_visuals"])  # Always overwrite temp dir; skip HTML output
+            if self.database_dir and not self.use_mmseqs:
+                cmd.extend(["--database", self.database_dir])
+            
+            cmd.extend([
+                "--num_recycles", str(num_recycles),
+                "--override", "--no_visuals"
+            ])
             
             print(f"      Running: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -153,6 +292,14 @@ class ABCFoldIntegration:
                 'confidence': confidence,
                 'pae_mean': pae_mean
             }
+    
+    def _cuda_available(self) -> bool:
+        """Check if CUDA is available."""
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except:
+            return False
     
     def _create_af3_json(self, sequence: str, output_path: Path):
         """Create AF3 input JSON file."""
@@ -246,3 +393,16 @@ class ABCFoldIntegration:
             'confidence': confidence,
             'pae_mean': max(0, pae_mean)
         }
+
+
+# Convenience functions for direct backend access
+def predict_with_boltz(sequence: str, num_recycles: int = 3, allow_fallback: bool = True) -> Dict:
+    """Predict structure using Boltz directly."""
+    integration = ABCFoldIntegration(engine="boltz", allow_fallback=allow_fallback)
+    return integration.predict_structure(sequence, num_recycles)
+
+
+def predict_with_chai(sequence: str, num_recycles: int = 1, allow_fallback: bool = True) -> Dict:
+    """Predict structure using Chai-1 directly."""
+    integration = ABCFoldIntegration(engine="chai1", allow_fallback=allow_fallback)
+    return integration.predict_structure(sequence, num_recycles)
