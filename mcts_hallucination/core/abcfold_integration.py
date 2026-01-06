@@ -36,6 +36,7 @@ class ABCFoldIntegration:
         use_mock: bool = False,
         engine: str = "af3",
         allow_fallback: bool = False,
+        molecule_type: str = "protein",
     ):
         """
         Initialize ABCFold integration.
@@ -46,6 +47,8 @@ class ABCFoldIntegration:
             use_mmseqs: Use MMseqs2 for faster MSA (recommended)
             use_mock: Use mock mode for testing (set False for real AF3)
             engine: Which ABCFold backend to call (af3, boltz, chai1)
+            allow_fallback: Fall back to mock on errors
+            molecule_type: "protein", "dna", or "rna" - determines FASTA/JSON format
         """
         self.model_params = model_params
         self.database_dir = database_dir
@@ -53,6 +56,7 @@ class ABCFoldIntegration:
         self.use_mock = use_mock
         self.engine = engine.lower()
         self.allow_fallback = allow_fallback
+        self.molecule_type = molecule_type.lower()
         
         if self.engine not in self.ENGINE_FLAGS:
             raise ValueError(f"Unsupported ABCFold engine '{engine}'. Choose from {list(self.ENGINE_FLAGS)}.")
@@ -64,6 +68,7 @@ class ABCFoldIntegration:
             print(f"🔧 ABCFold Integration initialized (MOCK MODE)")
         else:
             print(f"🔧 ABCFold Integration initialized (REAL MODE - {self.engine.upper()})")
+            print(f"   Molecule type: {self.molecule_type}")
             if self.engine == "af3":
                 print(f"   Model params: {model_params}")
                 print(f"   Use MMseqs2: {use_mmseqs}")
@@ -112,9 +117,11 @@ class ABCFoldIntegration:
             tmpdir = Path(tmpdir)
             
             # Create FASTA file in Boltz format: >CHAIN_ID|ENTITY_TYPE
+            # Entity type must match molecule_type (protein, dna, rna)
+            entity_type = self.molecule_type  # "protein", "dna", or "rna"
             fasta_path = tmpdir / "input.fasta"
             with open(fasta_path, 'w') as f:
-                f.write(f">A|protein\n{sequence}\n")
+                f.write(f">A|{entity_type}\n{sequence}\n")
             
             output_dir = tmpdir / "output"
             
@@ -190,10 +197,12 @@ class ABCFoldIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
             
-            # Create FASTA file in Chai format
+            # Create FASTA file in Chai format: >entity_type|name=...
+            # Entity type must match molecule_type (protein, dna, rna)
+            entity_type = self.molecule_type  # "protein", "dna", or "rna"
             fasta_path = tmpdir / "input.fasta"
             with open(fasta_path, 'w') as f:
-                f.write(f">protein|name=hallucination\n{sequence}\n")
+                f.write(f">{entity_type}|name=hallucination\n{sequence}\n")
             
             output_dir = tmpdir / "output"
             
@@ -302,15 +311,21 @@ class ABCFoldIntegration:
             return False
     
     def _create_af3_json(self, sequence: str, output_path: Path):
-        """Create AF3 input JSON file."""
+        """Create AF3 input JSON file with correct molecule type."""
+        # Build sequence entry based on molecule_type
+        # AF3 JSON uses keys: "protein", "dna", "rna"
+        mol_type = self.molecule_type  # "protein", "dna", or "rna"
+        
+        sequence_entry = {
+            mol_type: {
+                "id": ["A"],
+                "sequence": sequence
+            }
+        }
+        
         af3_input = {
             "name": "hallucination",
-            "sequences": [{
-                "protein": {
-                    "id": ["A"],
-                    "sequence": sequence
-                }
-            }],
+            "sequences": [sequence_entry],
             "modelSeeds": [1],
             "dialect": "alphafold3",
             "version": 1

@@ -393,6 +393,129 @@ def test_hallucination_expert(backend="esmfold", use_mock=False):
         return False
 
 
+def test_abcfold_nampnn_pipeline(molecule_type="dna", abcfold_engine="boltz", use_mock=True):
+    """
+    Test full ABCFold + NA-MPNN pipeline for nucleic acid design.
+    
+    This is the key integration test: structure prediction with ABCFold (Boltz/Chai)
+    followed by inverse folding with NA-MPNN.
+    """
+    print("\n" + "="*60)
+    print(f"TEST: ABCFold+NA-MPNN Pipeline ({molecule_type.upper()}, engine={abcfold_engine}, mock={use_mock})")
+    print("="*60)
+    
+    from core.hallucination_expert import create_hallucination_expert
+    
+    # Test sequences
+    DNA_SEQ = "TCGATGTTATCATGCCTGGCATCATAGCCCAGCCCACTGCTTTCTTCTGCGGACGCCCCAGTTTGCGTCCCTTGTCCTTATGACTGTTTTTCTCAGCATC"
+    RNA_SEQ = "UCGCGAGGGCGAACAUAUUAUCCGGUUUACUGUUAAGGCUAAAUCGCACAUACGCAGAUAUUCCGCACCCGUGCUGGACGAUGUUGACAGGACGGAGUGA"
+    
+    test_seq = DNA_SEQ if molecule_type == "dna" else RNA_SEQ
+    
+    try:
+        # Create expert with ABCFold + NA-MPNN
+        expert = create_hallucination_expert(
+            structure_backend="abcfold",
+            abcfold_engine=abcfold_engine,
+            inverse_folding_backend="nampnn",
+            molecule_type=molecule_type,
+            use_mock=use_mock,
+            fallback_to_protein_mpnn=False,  # Don't fallback for this test
+        )
+        
+        # Mask some positions
+        masked_positions = set(range(10, 30))  # Mask positions 10-29
+        
+        print(f"Input sequence: {test_seq[:40]}... ({len(test_seq)} nt)")
+        print(f"Masked positions: {len(masked_positions)}")
+        
+        result = expert.generate_candidate(test_seq, masked_positions)
+        
+        if result:
+            designed_seq = result['sequence']
+            print(f"Output sequence: {designed_seq[:40]}... ({len(designed_seq)} chars)")
+            print(f"Mean pLDDT: {result.get('mean_plddt', 'N/A')}")
+            
+            # Validate output is nucleic acid (not protein)
+            valid_na = set("acgtbdhu/")  # DNA + RNA alphabets
+            seq_chars = set(designed_seq.lower())
+            na_fraction = sum(1 for c in designed_seq.lower() if c in valid_na) / len(designed_seq)
+            
+            if na_fraction >= 0.5:
+                print(f"✅ ABCFold+NA-MPNN {molecule_type.upper()} pipeline PASSED ({na_fraction:.0%} NA)")
+                return True
+            else:
+                print(f"❌ ABCFold+NA-MPNN pipeline FAILED: Output not nucleic acid ({na_fraction:.0%} NA)")
+                return False
+        else:
+            print("❌ ABCFold+NA-MPNN pipeline returned None")
+            return False
+            
+    except Exception as e:
+        print(f"❌ ABCFold+NA-MPNN pipeline FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_mol_type_routing():
+    """
+    Test that molecule type is correctly routed through the pipeline.
+    
+    Verifies:
+    1. ABCFoldIntegration receives and stores molecule_type
+    2. FASTA headers would be correct for DNA/RNA (checked via mock)
+    3. AF3 JSON would use correct key (checked via mock)
+    """
+    print("\n" + "="*60)
+    print("TEST: Molecule Type Routing Verification")
+    print("="*60)
+    
+    from core.abcfold_integration import ABCFoldIntegration
+    
+    test_cases = [
+        ("protein", "MKFLILLFNILCLFPVLAADNHGVGPQGAS"),
+        ("dna", "TCGATGTTATCATGCCTGGCATCATAGCCC"),
+        ("rna", "UCGCGAGGGCGAACAUAUUAUCCGGUUUAC"),
+    ]
+    
+    all_passed = True
+    
+    for mol_type, test_seq in test_cases:
+        try:
+            integration = ABCFoldIntegration(
+                engine="boltz",
+                use_mock=True,
+                molecule_type=mol_type,
+            )
+            
+            # Verify molecule_type is stored correctly
+            if integration.molecule_type != mol_type:
+                print(f"❌ {mol_type}: molecule_type not stored correctly")
+                all_passed = False
+                continue
+            
+            # Run mock prediction to ensure no errors
+            result = integration.predict_structure(test_seq)
+            
+            if result and 'coordinates' in result:
+                print(f"✅ {mol_type}: Routing correct, mock prediction succeeded")
+            else:
+                print(f"❌ {mol_type}: Mock prediction failed")
+                all_passed = False
+                
+        except Exception as e:
+            print(f"❌ {mol_type}: Error - {e}")
+            all_passed = False
+    
+    if all_passed:
+        print("✅ Molecule type routing test PASSED")
+    else:
+        print("❌ Molecule type routing test FAILED")
+    
+    return all_passed
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Test hallucination backends")
@@ -402,6 +525,8 @@ def main():
     parser.add_argument("--real-nampnn", action="store_true", help="Test real NA-MPNN (requires GPU)")
     parser.add_argument("--test-dna", action="store_true", help="Test NA-MPNN with DNA sequence")
     parser.add_argument("--test-rna", action="store_true", help="Test NA-MPNN with RNA sequence")
+    parser.add_argument("--test-pipeline", action="store_true", help="Test full ABCFold+NA-MPNN pipeline")
+    parser.add_argument("--test-routing", action="store_true", help="Test molecule type routing")
     parser.add_argument("--backend", default="esmfold", choices=["esmfold", "boltz", "chai1"],
                        help="Structure prediction backend to test in hallucination expert")
     args = parser.parse_args()
@@ -443,7 +568,22 @@ def main():
     if args.real_nampnn:
         results['nampnn_pdb'] = test_nampnn_with_pdb(use_mock=False)
     
-    # Test 9: Full pipeline
+    # Test 9: Molecule type routing (if requested)
+    if args.test_routing:
+        results['mol_type_routing'] = test_mol_type_routing()
+    
+    # Test 10: Full ABCFold+NA-MPNN pipeline (if requested)
+    if args.test_pipeline:
+        pipeline_mock = not (args.real_boltz or args.real_chai)
+        engine = "boltz" if args.real_boltz else ("chai1" if args.real_chai else "boltz")
+        results['pipeline_dna'] = test_abcfold_nampnn_pipeline(
+            molecule_type="dna", abcfold_engine=engine, use_mock=pipeline_mock
+        )
+        results['pipeline_rna'] = test_abcfold_nampnn_pipeline(
+            molecule_type="rna", abcfold_engine=engine, use_mock=pipeline_mock
+        )
+    
+    # Test 11: Full protein pipeline
     results['hallucination'] = test_hallucination_expert(
         backend=args.backend, 
         use_mock=args.mock

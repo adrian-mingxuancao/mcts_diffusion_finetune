@@ -173,13 +173,16 @@ class NAMPNNIntegration:
         """
         # Interface compatibility mode: just coordinates and masked_sequence
         if coordinates is not None and pdb_path is None:
+            # Infer molecule type from masked_sequence if available
+            mol_type = self._infer_molecule_type(masked_sequence) if masked_sequence else "protein"
+            
             if self.use_mock:
-                result = self._mock_design(coordinates)
+                result = self._mock_design(coordinates, molecule_type=mol_type)
                 return result["sequences"][0] if result["sequences"] else ""
             else:
                 # Need to create temp PDB for real mode
                 seq_len = len(masked_sequence) if masked_sequence else len(coordinates)
-                return self.design_from_coords(coordinates, seq_len, "protein")
+                return self.design_from_coords(coordinates, seq_len, mol_type)
         
         # Full API mode with pdb_path
         if self.use_mock:
@@ -295,7 +298,7 @@ class NAMPNNIntegration:
             "log_probs": None,  # Would need to parse stats file for this
         }
     
-    def _mock_design(self, coordinates: Optional[np.ndarray] = None) -> Dict:
+    def _mock_design(self, coordinates: Optional[np.ndarray] = None, molecule_type: str = "protein") -> Dict:
         """Mock sequence design for testing."""
         # Determine sequence length
         if coordinates is not None:
@@ -303,20 +306,48 @@ class NAMPNNIntegration:
         else:
             n = 50  # Default mock length
         
-        # Generate random sequences (protein-like)
+        # Generate random sequences based on molecule type
+        if molecule_type == "dna":
+            alphabet = self.DNA_BASES  # "acgt"
+        elif molecule_type == "rna":
+            alphabet = self.RNA_BASES  # "bdhu"
+        else:
+            alphabet = self.AMINO_ACIDS
+        
         sequences = []
         for _ in range(max(1, self.num_samples)):
-            # Generate a mix of protein and DNA (simplified mock)
-            # In real usage, this would be determined by the input structure
-            seq = ''.join(np.random.choice(list(self.AMINO_ACIDS), size=n))
+            seq = ''.join(np.random.choice(list(alphabet), size=n))
             sequences.append(seq)
         
         return {
             "sequences": sequences,
-            "native_sequence": ''.join(np.random.choice(list(self.AMINO_ACIDS), size=n)),
+            "native_sequence": ''.join(np.random.choice(list(alphabet), size=n)),
             "confidence": np.random.uniform(0.5, 0.9),
             "log_probs": None,
         }
+    
+    def _infer_molecule_type(self, sequence: str) -> str:
+        """Infer molecule type from sequence characters."""
+        if not sequence:
+            return "protein"
+        
+        # Remove mask characters and convert to uppercase
+        clean_seq = sequence.replace('X', '').replace('x', '').upper()
+        if not clean_seq:
+            return "protein"
+        
+        # Check for DNA (ACGT only)
+        dna_chars = set("ACGT")
+        if all(c in dna_chars for c in clean_seq):
+            return "dna"
+        
+        # Check for RNA (ACGU only, with U being the distinguishing character)
+        rna_chars = set("ACGU")
+        if all(c in rna_chars for c in clean_seq) and 'U' in clean_seq:
+            return "rna"
+        
+        # Default to protein
+        return "protein"
     
     def design_from_coords(
         self,

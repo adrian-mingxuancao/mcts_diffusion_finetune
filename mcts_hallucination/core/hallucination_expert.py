@@ -182,6 +182,7 @@ class HallucinationExpert:
                 use_mmseqs=abcfold_use_mmseqs,
                 use_mock=use_mock,
                 engine=abcfold_engine,
+                molecule_type=molecule_type,  # Pass molecule type for correct FASTA/JSON format
             )
             self.backend_label = f"ABCFold ({abcfold_engine.upper()})"
         elif self.structure_backend == "esmfold":
@@ -292,13 +293,13 @@ class HallucinationExpert:
             mean_plddt = np.mean(confidence_scores)
             print(f"      ✅ {self.backend_label}: Structure predicted (mean pLDDT: {mean_plddt:.1f})")
             
-            # Step 3: ProteinMPNN inverse folding
-            print(f"      🧬 ProteinMPNN: Designing sequence...")
-            designed_sequence = self.proteinmpnn.design_sequence(
+            # Step 3: Inverse folding (ProteinMPNN or NA-MPNN)
+            print(f"      🧬 {self.inverse_folder_label}: Designing sequence...")
+            designed_sequence = self.inverse_folder.design_sequence(
                 hallucinated_coords,
                 masked_sequence=masked_seq,
             )
-            print(f"      ✅ ProteinMPNN: Sequence designed")
+            print(f"      ✅ {self.inverse_folder_label}: Sequence designed")
             
             # Step 4: Compute entropy from confidence variance
             entropy = self._compute_entropy(confidence_scores)
