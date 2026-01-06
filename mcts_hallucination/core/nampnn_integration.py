@@ -357,25 +357,74 @@ class NAMPNNIntegration:
         molecule_type: str,
         output_path: str,
     ):
-        """Write coordinates to a temporary PDB file."""
+        """Write coordinates to a temporary PDB file.
+        
+        For nucleic acids, NA-MPNN requires multiple backbone atoms per residue:
+        P, OP1, OP2, O5', C5', C4', O4', C3', O3', C2', O2' (RNA only), C1'
+        
+        We generate these atoms with approximate B-DNA/A-RNA geometry offsets
+        from the provided C1' coordinates.
+        """
         with open(output_path, 'w') as f:
+            atom_num = 1
+            
             for i in range(min(len(coordinates), sequence_length)):
-                x, y, z = coordinates[i]
+                x, y, z = coordinates[i]  # This is the C1' position
                 
                 if molecule_type == "protein":
                     resname = "ALA"
-                    atom_name = "CA"
-                elif molecule_type == "dna":
-                    resname = "DA"
-                    atom_name = "C1'"
-                else:  # rna
-                    resname = "A"
-                    atom_name = "C1'"
-                
-                f.write(
-                    f"ATOM  {i+1:5d}  {atom_name:4s}{resname:3s} A{i+1:4d}    "
-                    f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00 70.00           C\n"
-                )
+                    # For protein, write CA atom
+                    f.write(
+                        f"ATOM  {atom_num:5d}  CA  {resname:3s} A{i+1:4d}    "
+                        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00 70.00           C\n"
+                    )
+                    atom_num += 1
+                else:
+                    # DNA or RNA - need full backbone atoms
+                    if molecule_type == "dna":
+                        # Cycle through DNA bases for variety
+                        bases = ["DA", "DC", "DG", "DT"]
+                        resname = bases[i % 4]
+                    else:  # rna
+                        bases = ["A", "C", "G", "U"]
+                        resname = bases[i % 4]
+                    
+                    # Generate backbone atoms with approximate offsets from C1'
+                    # These offsets are approximate B-DNA geometry
+                    backbone_atoms = [
+                        ("P",    x - 1.5, y + 6.0, z - 0.5),
+                        ("OP1",  x - 2.5, y + 6.5, z - 0.5),
+                        ("OP2",  x - 0.5, y + 6.5, z - 0.5),
+                        ("O5'",  x - 1.5, y + 4.5, z + 0.0),
+                        ("C5'",  x - 1.0, y + 3.5, z + 0.5),
+                        ("C4'",  x - 0.5, y + 2.5, z + 1.0),
+                        ("O4'",  x + 0.5, y + 2.0, z + 0.5),
+                        ("C3'",  x - 1.5, y + 2.0, z + 1.5),
+                        ("O3'",  x - 2.0, y + 1.0, z + 2.0),
+                        ("C2'",  x - 0.5, y + 1.5, z + 1.5),
+                        ("C1'",  x, y, z),
+                    ]
+                    
+                    # Add O2' for RNA only
+                    if molecule_type == "rna":
+                        backbone_atoms.insert(-1, ("O2'", x - 0.5, y + 0.5, z + 2.0))
+                    
+                    for atom_name, ax, ay, az in backbone_atoms:
+                        # Format atom name for PDB (left-justified in 4 chars)
+                        if len(atom_name) < 4:
+                            atom_name_fmt = f" {atom_name:<3s}"
+                        else:
+                            atom_name_fmt = atom_name[:4]
+                        
+                        # Get element from first character
+                        element = atom_name[0]
+                        
+                        f.write(
+                            f"ATOM  {atom_num:5d} {atom_name_fmt} {resname:3s} A{i+1:4d}    "
+                            f"{ax:8.3f}{ay:8.3f}{az:8.3f}  1.00 70.00           {element:>2s}\n"
+                        )
+                        atom_num += 1
+            
             f.write("END\n")
     
     @staticmethod
