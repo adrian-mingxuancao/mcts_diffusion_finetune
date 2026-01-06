@@ -495,6 +495,222 @@ class ComplexInput:
         with open(path, 'w') as f:
             json.dump(self.to_dict(), f, indent=indent)
     
+    # -------------------------------------------------------------------------
+    # Boltz Format Export
+    # -------------------------------------------------------------------------
+    
+    def to_boltz_fasta(self, path: Union[str, Path] = None) -> str:
+        """
+        Convert to Boltz FASTA format.
+        
+        Format: >chain_id|entity_type
+        
+        Args:
+            path: Optional output file path
+            
+        Returns:
+            FASTA string
+        """
+        lines = []
+        
+        for chain_id in self._chain_order:
+            chain = self.chains[chain_id]
+            entity_type = chain.molecule_type
+            
+            if isinstance(chain, Ligand):
+                # Ligands use SMILES or CCD code
+                if chain.smiles:
+                    lines.append(f">{chain_id}|ligand")
+                    lines.append(chain.smiles)
+                elif chain.ccd_code:
+                    lines.append(f">{chain_id}|ligand")
+                    lines.append(chain.ccd_code)
+            else:
+                # Protein/DNA/RNA use sequence
+                lines.append(f">{chain_id}|{entity_type}")
+                lines.append(chain.sequence)
+        
+        fasta_content = "\n".join(lines) + "\n"
+        
+        if path:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(fasta_content)
+        
+        return fasta_content
+    
+    def to_boltz_yaml_dict(self) -> Dict:
+        """
+        Convert to Boltz YAML format dictionary.
+        
+        Returns:
+            Dict for Boltz YAML input
+        """
+        sequences = []
+        
+        for chain_id in self._chain_order:
+            chain = self.chains[chain_id]
+            
+            if isinstance(chain, ProteinChain):
+                entry = {
+                    "protein": {
+                        "id": chain.chain_id,
+                        "sequence": chain.sequence,
+                    }
+                }
+                if chain.modifications:
+                    entry["protein"]["modifications"] = [
+                        {"position": m["ptmPosition"], "ccd": m["ptmType"]}
+                        for m in chain.modifications
+                    ]
+                sequences.append(entry)
+                
+            elif isinstance(chain, DNAChain):
+                entry = {
+                    "dna": {
+                        "id": chain.chain_id,
+                        "sequence": chain.sequence,
+                    }
+                }
+                if chain.modifications:
+                    entry["dna"]["modifications"] = [
+                        {"position": m["basePosition"], "ccd": m["modificationType"]}
+                        for m in chain.modifications
+                    ]
+                sequences.append(entry)
+                
+            elif isinstance(chain, RNAChain):
+                entry = {
+                    "rna": {
+                        "id": chain.chain_id,
+                        "sequence": chain.sequence,
+                    }
+                }
+                if chain.modifications:
+                    entry["rna"]["modifications"] = [
+                        {"position": m["basePosition"], "ccd": m["modificationType"]}
+                        for m in chain.modifications
+                    ]
+                sequences.append(entry)
+                
+            elif isinstance(chain, Ligand):
+                entry = {"ligand": {"id": chain.chain_id}}
+                if chain.smiles:
+                    entry["ligand"]["smiles"] = chain.smiles
+                elif chain.ccd_code:
+                    entry["ligand"]["ccd"] = chain.ccd_code
+                sequences.append(entry)
+        
+        result = {"sequences": sequences}
+        
+        # Add constraints (bonds) if present
+        if self.bonds:
+            constraints = []
+            for bond in self.bonds:
+                constraints.append({
+                    "bond": {
+                        "atom1": [bond.chain1, bond.residue1, bond.atom1],
+                        "atom2": [bond.chain2, bond.residue2, bond.atom2],
+                    }
+                })
+            result["constraints"] = constraints
+        
+        return result
+    
+    def to_boltz_yaml(self, path: Union[str, Path] = None) -> str:
+        """
+        Convert to Boltz YAML format string.
+        
+        Args:
+            path: Optional output file path
+            
+        Returns:
+            YAML string
+        """
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required for YAML export. Install with: pip install pyyaml")
+        
+        yaml_dict = self.to_boltz_yaml_dict()
+        yaml_content = yaml.dump(yaml_dict, default_flow_style=False, sort_keys=False)
+        
+        if path:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(yaml_content)
+        
+        return yaml_content
+    
+    # -------------------------------------------------------------------------
+    # Chai-1 Format Export
+    # -------------------------------------------------------------------------
+    
+    def to_chai_fasta(self, path: Union[str, Path] = None) -> str:
+        """
+        Convert to Chai-1 FASTA format.
+        
+        Format: >entity_type|name=chain_id
+        
+        Args:
+            path: Optional output file path
+            
+        Returns:
+            FASTA string
+        """
+        lines = []
+        
+        for chain_id in self._chain_order:
+            chain = self.chains[chain_id]
+            entity_type = chain.molecule_type
+            
+            if isinstance(chain, Ligand):
+                # Ligands use SMILES
+                if chain.smiles:
+                    lines.append(f">ligand|name={chain_id}")
+                    lines.append(chain.smiles)
+                elif chain.ccd_code:
+                    # Chai-1 prefers SMILES, but can use CCD as name
+                    lines.append(f">ligand|name={chain_id}")
+                    lines.append(chain.ccd_code)
+            else:
+                # Protein/DNA/RNA use sequence
+                lines.append(f">{entity_type}|name={chain_id}")
+                lines.append(chain.sequence)
+        
+        fasta_content = "\n".join(lines) + "\n"
+        
+        if path:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(fasta_content)
+        
+        return fasta_content
+    
+    # -------------------------------------------------------------------------
+    # AF3 JSON (alias for consistency)
+    # -------------------------------------------------------------------------
+    
+    def to_af3_json(self, path: Union[str, Path] = None, indent: int = 2) -> str:
+        """
+        Convert to AF3 JSON format string.
+        
+        Args:
+            path: Optional output file path
+            indent: JSON indentation
+            
+        Returns:
+            JSON string
+        """
+        json_content = json.dumps(self.to_dict(), indent=indent)
+        
+        if path:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json_content)
+        
+        return json_content
+    
     def __repr__(self) -> str:
         chain_summary = ", ".join(
             f"{c.chain_id}:{c.molecule_type}" for c in self.chains.values()
