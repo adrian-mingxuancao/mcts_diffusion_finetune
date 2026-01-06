@@ -1,0 +1,3 @@
+[submodule "mcts_hallucination/extra/NA-MPNN"]
+	path = mcts_hallucination/extra/NA-MPNN
+	url = https://github.com/baker-laboratory/NA-MPNN.git
