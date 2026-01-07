@@ -458,6 +458,114 @@ def test_abcfold_nampnn_pipeline(molecule_type="dna", abcfold_engine="boltz", us
         return False
 
 
+def test_boltzdesign(use_mock=True):
+    """Test BoltzDesign1 integration."""
+    print("\n" + "="*60)
+    print(f"TEST: BoltzDesign1 (mock={use_mock})")
+    print("="*60)
+    
+    try:
+        from core.boltzdesign_integration import BoltzDesignIntegration
+        
+        integration = BoltzDesignIntegration(use_mock=use_mock)
+        
+        # Test binder design for protein target
+        result = integration.design_binder(
+            target_pdb="test_target",
+            target_type="protein",
+            binder_length_min=50,
+            binder_length_max=80,
+            num_designs=2,
+        )
+        
+        print(f"Number of designs: {result['num_designs']}")
+        print(f"Target type: {result['target_type']}")
+        
+        for i, design in enumerate(result['designs']):
+            print(f"  Design {i+1}: {design['sequence'][:30]}... ({len(design['sequence'])} aa)")
+            print(f"    pLDDT: {design['plddt']:.1f}, iPTM: {design['iptm']:.3f}")
+        
+        print("✅ BoltzDesign1 test PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"❌ BoltzDesign1 test FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_pocketgen(use_mock=True):
+    """Test PocketGen integration."""
+    print("\n" + "="*60)
+    print(f"TEST: PocketGen (mock={use_mock})")
+    print("="*60)
+    
+    try:
+        from core.pocketgen_integration import PocketGenIntegration
+        
+        integration = PocketGenIntegration(use_mock=use_mock)
+        
+        # Test pocket generation
+        result = integration.generate_pocket(
+            ligand_sdf="test_ligand.sdf",
+            num_residues=20,
+            num_samples=2,
+        )
+        
+        print(f"Number of pockets: {result['num_samples']}")
+        print(f"Pocket size: {result['num_residues']} residues")
+        
+        for i, pocket in enumerate(result['pockets']):
+            print(f"  Pocket {i+1}: {pocket['sequence'][:20]}... ({len(pocket['sequence'])} aa)")
+            print(f"    AAR: {pocket['aar']:.3f}, scRMSD: {pocket['sc_rmsd']:.2f}Å")
+        
+        print("✅ PocketGen test PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"❌ PocketGen test FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_rnaframeflow(use_mock=True):
+    """Test RNA-FrameFlow integration."""
+    print("\n" + "="*60)
+    print(f"TEST: RNA-FrameFlow (mock={use_mock})")
+    print("="*60)
+    
+    try:
+        from core.rnaframeflow_integration import RNAFrameFlowIntegration
+        
+        integration = RNAFrameFlowIntegration(use_mock=use_mock)
+        
+        # Test RNA backbone generation
+        result = integration.generate_backbone(
+            length=50,
+            num_samples=2,
+        )
+        
+        print(f"Number of backbones: {result['num_samples']}")
+        print(f"Target length: {result['length']} nt")
+        
+        for i, backbone in enumerate(result['backbones']):
+            print(f"  Backbone {i+1}: {backbone['sequence'][:20]}... ({backbone['length']} nt)")
+            print(f"    Validity: {backbone['validity']}")
+            if 'diversity' in backbone:
+                print(f"    Diversity: {backbone['diversity']:.3f}, Novelty: {backbone['novelty']:.3f}")
+        
+        print("✅ RNA-FrameFlow test PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"❌ RNA-FrameFlow test FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def test_mol_type_routing():
     """
     Test that molecule type is correctly routed through the pipeline.
@@ -527,6 +635,10 @@ def main():
     parser.add_argument("--test-rna", action="store_true", help="Test NA-MPNN with RNA sequence")
     parser.add_argument("--test-pipeline", action="store_true", help="Test full ABCFold+NA-MPNN pipeline")
     parser.add_argument("--test-routing", action="store_true", help="Test molecule type routing")
+    parser.add_argument("--test-boltzdesign", action="store_true", help="Test BoltzDesign1 binder design")
+    parser.add_argument("--test-pocketgen", action="store_true", help="Test PocketGen pocket generation")
+    parser.add_argument("--test-rnaframeflow", action="store_true", help="Test RNA-FrameFlow backbone design")
+    parser.add_argument("--test-new-models", action="store_true", help="Test all new models (BoltzDesign1, PocketGen, RNA-FrameFlow)")
     parser.add_argument("--backend", default="esmfold", choices=["esmfold", "boltz", "chai1"],
                        help="Structure prediction backend to test in hallucination expert")
     args = parser.parse_args()
@@ -583,7 +695,19 @@ def main():
             molecule_type="rna", abcfold_engine=engine, use_mock=pipeline_mock
         )
     
-    # Test 11: Full protein pipeline
+    # Test 11: BoltzDesign1 (if requested)
+    if args.test_boltzdesign or args.test_new_models:
+        results['boltzdesign'] = test_boltzdesign(use_mock=args.mock)
+    
+    # Test 12: PocketGen (if requested)
+    if args.test_pocketgen or args.test_new_models:
+        results['pocketgen'] = test_pocketgen(use_mock=args.mock)
+    
+    # Test 13: RNA-FrameFlow (if requested)
+    if args.test_rnaframeflow or args.test_new_models:
+        results['rnaframeflow'] = test_rnaframeflow(use_mock=args.mock)
+    
+    # Test 14: Full protein pipeline
     results['hallucination'] = test_hallucination_expert(
         backend=args.backend, 
         use_mock=args.mock
