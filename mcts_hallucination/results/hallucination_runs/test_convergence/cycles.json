@@ -1,0 +1,26 @@
+[
+  {
+    "cycle_index": 0,
+    "sequence": "YFPNDQRDTWFNWWYLVDWAMYETKQARPVCRDTRGLPSETLNHPIVHMQ",
+    "seq_length": 50,
+    "mean_plddt": 79.3636327690583,
+    "pae_mean": null,
+    "parent_child_convergence": 0.08,
+    "reward": 0.2940908983071749,
+    "depth": 1,
+    "alanine_fraction": 0.04,
+    "glycine_fraction": 0.02
+  },
+  {
+    "cycle_index": 1,
+    "sequence": "MWDEVTTINNLDGWTHFKYTMKYHVNDKDKRNFPVYMNQKLWPENQNPVW",
+    "seq_length": 50,
+    "mean_plddt": 79.41541525866256,
+    "pae_mean": null,
+    "parent_child_convergence": 0.04,
+    "reward": 0.26624624577598766,
+    "depth": 2,
+    "alanine_fraction": 0.0,
+    "glycine_fraction": 0.02
+  }
+]

@@ -1,0 +1,122 @@
+[
+  {
+    "cycle_index": 0,
+    "sequence": "AHKRLDGGHLQEKTLMIIFGEAKMFRGYESAMIRRVQVPPSGCDTPEHVH",
+    "seq_length": 50,
+    "mean_plddt": 46.09526824951172,
+    "pae_mean": null,
+    "parent_child_convergence": 0.1,
+    "reward": 0.20828580474853514,
+    "depth": 1,
+    "alanine_fraction": 0.06,
+    "glycine_fraction": 0.1
+  },
+  {
+    "cycle_index": 1,
+    "sequence": "EKEKREKKIKNSVVERGRVNLDQHDWVRETAAGQIPQKVKAPQIVIHIIE",
+    "seq_length": 50,
+    "mean_plddt": 47.30519485473633,
+    "pae_mean": null,
+    "parent_child_convergence": 0.1,
+    "reward": 0.21191558456420895,
+    "depth": 1,
+    "alanine_fraction": 0.06,
+    "glycine_fraction": 0.04
+  },
+  {
+    "cycle_index": 2,
+    "sequence": "ATMWAILQILFKADIGTTCGAKIAKAADGLARNSKESGNKAVTTTERALS",
+    "seq_length": 50,
+    "mean_plddt": 57.39876937866211,
+    "pae_mean": null,
+    "parent_child_convergence": 0.08,
+    "reward": 0.22819630813598632,
+    "depth": 2,
+    "alanine_fraction": 0.2,
+    "glycine_fraction": 0.08
+  },
+  {
+    "cycle_index": 3,
+    "sequence": "QAVNDIPRQFIDGDIRARRKFERTPGSVESRKNERWGVIDLRRSPYQFEL",
+    "seq_length": 50,
+    "mean_plddt": 47.1493034362793,
+    "pae_mean": null,
+    "parent_child_convergence": 0.06,
+    "reward": 0.1834479103088379,
+    "depth": 2,
+    "alanine_fraction": 0.04,
+    "glycine_fraction": 0.06
+  },
+  {
+    "cycle_index": 4,
+    "sequence": "GKLVIPXELDKESKTSFATTVKDFLAKVNTLHLRAASDIVTEELDGSCLA",
+    "seq_length": 50,
+    "mean_plddt": 52.916664123535156,
+    "pae_mean": null,
+    "parent_child_convergence": 0.04,
+    "reward": 0.18674999237060544,
+    "depth": 2,
+    "alanine_fraction": 0.1,
+    "glycine_fraction": 0.04
+  },
+  {
+    "cycle_index": 5,
+    "sequence": "SLLQYEVPHWHIIHHVFTEKLANTRLRRKIGKVHEGSPIQPPSWHIGKLL",
+    "seq_length": 50,
+    "mean_plddt": 44.896759033203125,
+    "pae_mean": null,
+    "parent_child_convergence": 0.04,
+    "reward": 0.16269027709960937,
+    "depth": 2,
+    "alanine_fraction": 0.02,
+    "glycine_fraction": 0.06
+  },
+  {
+    "cycle_index": 6,
+    "sequence": "GAVTDIANQLEESESCSDAAIIIRASSEIAITTARLEDHGMDLVLLSAAA",
+    "seq_length": 50,
+    "mean_plddt": 46.41643142700195,
+    "pae_mean": null,
+    "parent_child_convergence": 0.08,
+    "reward": 0.19524929428100585,
+    "depth": 3,
+    "alanine_fraction": 0.2,
+    "glycine_fraction": 0.04
+  },
+  {
+    "cycle_index": 7,
+    "sequence": "GETTLKCRQIGLIESAGFNGEYGKDIGEKPISLKKRMQLRIVIVKTSVAG",
+    "seq_length": 50,
+    "mean_plddt": 43.0012092590332,
+    "pae_mean": null,
+    "parent_child_convergence": 0.06,
+    "reward": 0.1710036277770996,
+    "depth": 3,
+    "alanine_fraction": 0.04,
+    "glycine_fraction": 0.14
+  },
+  {
+    "cycle_index": 8,
+    "sequence": "AVGRVQGRDDAISKENITKEVQSQIEIEKKYTGQFNEYKRDMNDVVADLS",
+    "seq_length": 50,
+    "mean_plddt": 59.95277404785156,
+    "pae_mean": null,
+    "parent_child_convergence": 0.1,
+    "reward": 0.2498583221435547,
+    "depth": 3,
+    "alanine_fraction": 0.06,
+    "glycine_fraction": 0.06
+  },
+  {
+    "cycle_index": 9,
+    "sequence": "DHEKLKKAKNNAHKEIVRAKAKAHEMESIRDNNKTTKLEGDHYKNGAGTY",
+    "seq_length": 50,
+    "mean_plddt": 62.45988464355469,
+    "pae_mean": null,
+    "parent_child_convergence": 0.06,
+    "reward": 0.22937965393066406,
+    "depth": 3,
+    "alanine_fraction": 0.12,
+    "glycine_fraction": 0.06
+  }
+]
