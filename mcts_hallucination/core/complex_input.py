@@ -17,14 +17,84 @@ import copy
 # =============================================================================
 
 @dataclass
+class StructureTemplate:
+    """
+    Structural template configuration for guiding structure prediction.
+    
+    Used by AF3 and Boltz to provide structural priors during prediction.
+    
+    Content (mutually exclusive):
+        mmcif: mmCIF content as string (AF3)
+        path: Path to CIF/PDB file (AF3/Boltz)
+    
+    Residue mapping (0-indexed, for partial templates):
+        query_indices: Which query residues to apply the template to
+        template_indices: Corresponding residue indices in the template
+    
+    Boltz-specific options:
+        chain_id: Chain ID in the template file to use
+        force: If True, applies a potential to enforce the template during diffusion
+        threshold: Max allowed deviation from template in Å (required if force=True)
+    """
+    # Template content (mutually exclusive)
+    mmcif: Optional[str] = None        # mmCIF content as string (AF3)
+    path: Optional[str] = None         # Path to CIF/PDB file (AF3/Boltz)
+    
+    # Residue mapping (0-indexed, for partial template)
+    query_indices: Optional[List[int]] = None     # Query residues using template
+    template_indices: Optional[List[int]] = None  # Corresponding template residues
+    
+    # Boltz-specific options
+    chain_id: Optional[str] = None     # Chain ID in template file
+    force: bool = False                # Enforce template during prediction
+    threshold: Optional[float] = None  # Max deviation from template (Å)
+    
+    def __post_init__(self):
+        # Validate mutual exclusivity
+        if self.mmcif and self.path:
+            raise ValueError("Cannot specify both mmcif and path - they are mutually exclusive")
+        
+        # Validate force requires threshold
+        if self.force and self.threshold is None:
+            raise ValueError("threshold is required when force=True")
+        
+        # Validate index lists have same length
+        if (self.query_indices is None) != (self.template_indices is None):
+            raise ValueError("query_indices and template_indices must both be specified or both be None")
+        if self.query_indices is not None and self.template_indices is not None:
+            if len(self.query_indices) != len(self.template_indices):
+                raise ValueError(
+                    f"query_indices ({len(self.query_indices)}) and template_indices "
+                    f"({len(self.template_indices)}) must have the same length"
+                )
+    
+    @property
+    def has_content(self) -> bool:
+        """Check if template has actual content (mmcif or path)."""
+        return self.mmcif is not None or self.path is not None
+
+
+@dataclass
 class ProteinChain:
-    """Specification for a protein chain."""
+    """
+    Specification for a protein chain.
+    
+    Attributes:
+        chain_id: Unique identifier for the chain
+        sequence: Amino acid sequence
+        fixed_sequence_positions: 1-indexed positions to keep fixed during inverse folding
+        modifications: List of modifications [{"ptmType": "HY3", "ptmPosition": 1}]
+        template: Optional structural template configuration
+    
+    For partial templates (scaffolding):
+        Use template.query_indices to specify which residues USE the template
+        Residues NOT in query_indices will be predicted de novo
+    """
     chain_id: str
     sequence: str
-    fixed_sequence_positions: Optional[List[int]] = None  # 1-indexed positions to keep fixed during inverse folding
-    modifications: Optional[List[Dict]] = None   # [{"ptmType": "HY3", "ptmPosition": 1}]
-    template_mmcif: Optional[str] = None         # mmCIF string for template
-    template_indices: Optional[List[int]] = None # Mapping for template
+    fixed_sequence_positions: Optional[List[int]] = None
+    modifications: Optional[List[Dict]] = None
+    template: Optional[StructureTemplate] = None
     
     @property
     def molecule_type(self) -> str:
@@ -41,6 +111,11 @@ class ProteinChain:
             return True  # All positions designable
         return len(self.fixed_sequence_positions) < len(self.sequence)
     
+    @property
+    def has_template(self) -> bool:
+        """Check if this chain has a template configured."""
+        return self.template is not None and self.template.has_content
+    
     def fix_all(self) -> 'ProteinChain':
         """Return a copy with all positions fixed (not designable)."""
         return ProteinChain(
@@ -48,9 +123,9 @@ class ProteinChain:
             sequence=self.sequence,
             fixed_sequence_positions=list(range(1, len(self.sequence) + 1)),
             modifications=self.modifications,
-            template_mmcif=self.template_mmcif,
-            template_indices=self.template_indices,
+            template=self.template,
         )
+
 
 
 @dataclass
@@ -200,8 +275,7 @@ class ComplexInput:
         sequence: str,
         fixed_sequence_positions: List[int] = None,
         modifications: List[Dict] = None,
-        template_mmcif: str = None,
-        template_indices: List[int] = None,
+        template: StructureTemplate = None,
     ) -> "ComplexInput":
         """Add a protein chain."""
         if chain_id in self.chains:
@@ -212,8 +286,7 @@ class ComplexInput:
             sequence=sequence,
             fixed_sequence_positions=fixed_sequence_positions,
             modifications=modifications,
-            template_mmcif=template_mmcif,
-            template_indices=template_indices,
+            template=template,
         )
         self._chain_order.append(chain_id)
         return self
@@ -375,8 +448,7 @@ class ComplexInput:
                 sequence=new_sequence,
                 fixed_sequence_positions=chain.fixed_sequence_positions,
                 modifications=chain.modifications,
-                template_mmcif=chain.template_mmcif,
-                template_indices=chain.template_indices,
+                template=chain.template,
             )
         elif isinstance(chain, DNAChain):
             new_input.chains[chain_id] = DNAChain(
@@ -429,16 +501,27 @@ class ComplexInput:
                 if chain.modifications:
                     protein_dict["modifications"] = chain.modifications
                 
-                # Add template if specified (uses fixed_sequence_positions for structure conditioning)
-                if chain.template_mmcif and chain.fixed_sequence_positions:
-                    # Convert 1-indexed positions to 0-indexed queryIndices
-                    query_indices = [p - 1 for p in chain.fixed_sequence_positions]
-                    template_indices = chain.template_indices or list(range(len(query_indices)))
-                    protein_dict["templates"] = [{
-                        "mmcif": chain.template_mmcif,
-                        "queryIndices": query_indices,
-                        "templateIndices": template_indices,
-                    }]
+                # Add template if specified
+                if chain.has_template:
+                    template_entry = {}
+                    tpl = chain.template
+                    
+                    # mmCIF content or path
+                    if tpl.mmcif:
+                        template_entry["mmcif"] = tpl.mmcif
+                    elif tpl.path:
+                        template_entry["mmcifPath"] = tpl.path
+                    
+                    # Residue mapping (query_indices/template_indices)
+                    if tpl.query_indices is not None and tpl.template_indices is not None:
+                        template_entry["queryIndices"] = tpl.query_indices
+                        template_entry["templateIndices"] = tpl.template_indices
+                    elif chain.fixed_sequence_positions:
+                        # Fallback: use fixed_sequence_positions for full coverage
+                        template_entry["queryIndices"] = [p - 1 for p in chain.fixed_sequence_positions]
+                        template_entry["templateIndices"] = list(range(len(chain.fixed_sequence_positions)))
+                    
+                    protein_dict["templates"] = [template_entry]
                 
                 sequences.append({"protein": protein_dict})
                 
@@ -615,6 +698,37 @@ class ComplexInput:
                 })
             result["constraints"] = constraints
         
+        # Add templates section (Boltz format)
+        templates = []
+        for chain_id in self._chain_order:
+            chain = self.chains[chain_id]
+            if isinstance(chain, ProteinChain) and chain.has_template:
+                template_entry = {}
+                tpl = chain.template
+                
+                # File path (cif or pdb)
+                if tpl.path:
+                    if tpl.path.lower().endswith('.pdb'):
+                        template_entry["pdb"] = tpl.path
+                    else:
+                        template_entry["cif"] = tpl.path
+                
+                # Chain mapping
+                template_entry["chain_id"] = chain.chain_id
+                if tpl.chain_id:
+                    template_entry["template_id"] = tpl.chain_id
+                
+                # Force constraint (Boltz-specific)
+                if tpl.force:
+                    template_entry["force"] = True
+                    if tpl.threshold:
+                        template_entry["threshold"] = tpl.threshold
+                
+                templates.append(template_entry)
+        
+        if templates:
+            result["templates"] = templates
+        
         return result
     
     def to_boltz_yaml(self, path: Union[str, Path] = None) -> str:
@@ -761,3 +875,111 @@ def fix_all_positions(sequence_length: int) -> List[int]:
     return list(range(1, sequence_length + 1))
 
 
+# =============================================================================
+# Template Helper Functions
+# =============================================================================
+
+def set_partial_template(
+    complex_input: ComplexInput,
+    chain_id: str,
+    query_indices: List[int],
+    template_indices: List[int],
+    template_path: str = None,
+    template_mmcif: str = None,
+    force: bool = False,
+    threshold: float = None,
+    template_chain_id: str = None,
+) -> ComplexInput:
+    """
+    Set up a partial template with explicit AF3-style residue indices.
+    
+    Args:
+        complex_input: The ComplexInput to modify
+        chain_id: Chain ID to set template for
+        query_indices: 0-indexed query residue indices that use the template
+        template_indices: 0-indexed indices of corresponding residues in template
+        template_path: Path to CIF/PDB template file
+        template_mmcif: mmCIF content as string (mutually exclusive with template_path)
+        force: Boltz force constraint (enforce template during prediction)
+        threshold: Max deviation from template in Å (required if force=True)
+        template_chain_id: Chain ID in template file (optional)
+        
+    Returns:
+        The modified ComplexInput (modified in place, also returned for chaining)
+        
+    Example:
+        # Template residues 0-29 and 60-99, skip 30-59 for de novo design
+        set_partial_template(
+            complex_input,
+            chain_id="A",
+            query_indices=list(range(30)) + list(range(60, 100)),
+            template_indices=list(range(70)),  # 70 residues in template
+            template_path="scaffold.cif",
+        )
+    """
+    chain = complex_input.chains.get(chain_id)
+    if not isinstance(chain, ProteinChain):
+        raise ValueError(f"Chain {chain_id} is not a ProteinChain")
+    
+    # Create and assign StructureTemplate (validation happens in dataclass)
+    chain.template = StructureTemplate(
+        mmcif=template_mmcif,
+        path=template_path,
+        query_indices=query_indices,
+        template_indices=template_indices,
+        chain_id=template_chain_id,
+        force=force,
+        threshold=threshold,
+    )
+    
+    return complex_input
+
+
+def set_full_template(
+    complex_input: ComplexInput,
+    chain_id: str,
+    template_path: str = None,
+    template_mmcif: str = None,
+    force: bool = False,
+    threshold: float = None,
+    template_chain_id: str = None,
+) -> ComplexInput:
+    """
+    Set up a full template (all residues use template).
+    
+    Args:
+        complex_input: The ComplexInput to modify
+        chain_id: Chain ID to set template for
+        template_path: Path to CIF/PDB template file
+        template_mmcif: mmCIF content as string (mutually exclusive with template_path)
+        force: Boltz force constraint
+        threshold: Max deviation from template in Å (required if force=True)
+        template_chain_id: Chain ID in template file (optional)
+        
+    Returns:
+        The modified ComplexInput
+    """
+    chain = complex_input.chains.get(chain_id)
+    if not isinstance(chain, ProteinChain):
+        raise ValueError(f"Chain {chain_id} is not a ProteinChain")
+    
+    if not template_path and not template_mmcif:
+        raise ValueError("Either template_path or template_mmcif must be provided")
+    
+    # Full coverage: all residues
+    n = len(chain.sequence)
+    query_indices = list(range(n))
+    template_indices = list(range(n))
+    
+    # Create and assign StructureTemplate
+    chain.template = StructureTemplate(
+        mmcif=template_mmcif,
+        path=template_path,
+        query_indices=query_indices,
+        template_indices=template_indices,
+        chain_id=template_chain_id,
+        force=force,
+        threshold=threshold,
+    )
+    
+    return complex_input
