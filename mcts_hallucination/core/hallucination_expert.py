@@ -193,10 +193,22 @@ class HallucinationExpert:
                 max_length=esmfold_max_length,
             )
             self.backend_label = "ESMFold"
+        elif self.structure_backend == "boltz":
+            # Direct Boltz backend (shortcut for abcfold with boltz engine)
+            self.structure_predictor = ABCFoldIntegration(
+                model_params=model_params,
+                database_dir=abcfold_database_dir,
+                use_mmseqs=abcfold_use_mmseqs,
+                use_mock=use_mock,
+                engine="boltz",
+                molecule_type=molecule_type,
+                allow_fallback=True,
+            )
+            self.backend_label = "Boltz"
         else:
             raise ValueError(
                 f"Unsupported structure backend '{structure_backend}'. "
-                f"Choose from: abcfold, esmfold"
+                f"Choose from: abcfold, esmfold, boltz"
             )
         
         # Initialize inverse folding backend

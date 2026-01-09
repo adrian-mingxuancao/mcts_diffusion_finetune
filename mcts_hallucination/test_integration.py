@@ -100,6 +100,9 @@ class HallucinationMCTS:
         device: str = "cuda",
         init_mode: str = "random",  # "random" or "all_x" or "all_a"
         output_dir: Optional[str] = None,  # Directory to save PDB files
+        structure_backend: str = "esmfold",  # "esmfold" or "boltz"
+        num_candidates: int = 2,  # K candidates per cycle (HalluDesign style)
+        traj_mode: str = "default",  # "short", "long", "default" - for future AF3 truncated diffusion
     ):
         self.sequence_length = sequence_length
         self.max_depth = max_depth
@@ -109,6 +112,9 @@ class HallucinationMCTS:
         self.use_mock = use_mock
         self.device = device
         self.init_mode = init_mode
+        self.structure_backend = structure_backend
+        self.num_candidates = num_candidates
+        self.traj_mode = traj_mode
         
         # Setup output directory for PDB files
         if output_dir:
@@ -118,17 +124,28 @@ class HallucinationMCTS:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.pdb_counter = 0
         
-        # Initialize ESMFold
-        print(f"🔧 Initializing ESMFold (mock={use_mock})...")
-        self.esmfold = ESMFoldIntegration(
-            device=device,
-            use_mock=use_mock,
-        )
+        # Initialize structure predictor based on backend
+        if structure_backend == "boltz":
+            print(f"🔧 Initializing Boltz (mock={use_mock})...")
+            from core.abcfold_integration import ABCFoldIntegration
+            self.structure_predictor = ABCFoldIntegration(
+                use_mock=use_mock,
+                engine="boltz",
+                allow_fallback=True,
+            )
+            self.esmfold = None
+        else:
+            print(f"🔧 Initializing ESMFold (mock={use_mock})...")
+            self.esmfold = ESMFoldIntegration(
+                device=device,
+                use_mock=use_mock,
+            )
+            self.structure_predictor = self.esmfold
         
         # Initialize ProteinMPNN (via hallucination expert for simplicity)
         print(f"🔧 Initializing ProteinMPNN (mock={use_mock})...")
         self.hallucination_expert = create_hallucination_expert(
-            structure_backend="esmfold",
+            structure_backend=structure_backend,
             esmfold_device=device,
             use_mock=use_mock,
             use_real_proteinmpnn=not use_mock,
@@ -140,6 +157,9 @@ class HallucinationMCTS:
         print(f"   Iterations: {num_iterations}")
         print(f"   Rollouts per expansion: {num_rollouts}")
         print(f"   Init mode: {init_mode}")
+        print(f"   Structure backend: {structure_backend}")
+        print(f"   Num candidates (K): {num_candidates}")
+        print(f"   Traj mode: {traj_mode}")
         print(f"   Output dir: {self.output_dir}")
     
     def generate_initial_sequence(self, length: int) -> str:
@@ -247,59 +267,70 @@ class HallucinationMCTS:
     
     def expand_node(self, node: HallucinationNode) -> List[HallucinationNode]:
         """
-        Expand a node by running ESMFold → ProteinMPNN cycle.
+        Expand a node by running Structure → ProteinMPNN cycle.
         
-        Convergence is measured by sibling similarity: how similar are the
-        sequences generated from the same structure? Higher sibling similarity
-        means the structure consistently produces similar sequences.
+        Like Protein Hunter / HalluDesign:
+        1. Fold current sequence to get structure
+        2. Sample K sequences from ProteinMPNN
+        3. Optionally fold each candidate to evaluate
+        4. Select best candidates based on reward
         
         Returns list of child nodes.
         """
-        # Step 1: ESMFold - predict structure from current sequence (once for all rollouts)
-        print(f"      🔮 ESMFold predicting structure from: {node.sequence[:30]}...")
-        structure_result = self.esmfold.predict_structure(node.sequence)
+        # Step 1: Predict structure from current sequence
+        backend_name = self.structure_backend.upper()
+        print(f"      🔮 {backend_name} predicting structure from: {node.sequence[:30]}...")
+        structure_result = self.structure_predictor.predict_structure(node.sequence)
         coords = structure_result['coordinates']
         parent_plddt = structure_result['confidence']
         parent_mean_plddt = float(np.mean(parent_plddt))
-        print(f"      ✅ ESMFold done - mean pLDDT={parent_mean_plddt:.1f}, min={np.min(parent_plddt):.1f}, max={np.max(parent_plddt):.1f}")
+        print(f"      ✅ {backend_name} done - mean pLDDT={parent_mean_plddt:.1f}, min={np.min(parent_plddt):.1f}, max={np.max(parent_plddt):.1f}")
         
-        # Step 2: Generate multiple sequences from the SAME structure (siblings)
-        sibling_sequences = []
-        sibling_data = []  # Store (sequence, coords, plddt) for each sibling
+        # Log traj_mode for future AF3 truncated diffusion support
+        if self.traj_mode != "default":
+            print(f"      📊 Traj mode: {self.traj_mode} (placeholder for future AF3 diffusion control)")
+        
+        # Step 2: Generate K candidate sequences from the structure
+        # This is the key HalluDesign insight: sample multiple, pick best
+        candidate_sequences = []
+        candidate_data = []  # Store (sequence, coords, plddt) for each candidate
+        
+        total_candidates = self.num_candidates * self.num_rollouts
+        print(f"      🧬 Generating {total_candidates} candidate sequences (K={self.num_candidates} x {self.num_rollouts} rollouts)...")
         
         for rollout in range(self.num_rollouts):
             try:
-                print(f"      🧬 Rollout {rollout+1}: ProteinMPNN designing sequence from structure...")
-                masked_seq = 'X' * len(node.sequence)
-                new_sequence = self.hallucination_expert.proteinmpnn.design_sequence(
-                    coordinates=coords,
-                    masked_sequence=masked_seq,
-                )
-                print(f"      ✅ Rollout {rollout+1}: ProteinMPNN done - new seq: {new_sequence[:30]}...")
-                
-                # Evaluate the new sequence with ESMFold
-                print(f"      🔮 Rollout {rollout+1}: ESMFold evaluating new sequence...")
-                new_structure_result = self.esmfold.predict_structure(new_sequence)
-                new_coords = new_structure_result['coordinates']
-                new_plddt = new_structure_result['confidence']
-                new_mean_plddt = float(np.mean(new_plddt))
-                print(f"      ✅ Rollout {rollout+1}: New seq pLDDT={new_mean_plddt:.1f}")
-                
-                sibling_sequences.append(new_sequence)
-                sibling_data.append((new_sequence, new_coords, new_plddt, new_mean_plddt))
+                # Generate K sequences per rollout
+                for k in range(self.num_candidates):
+                    masked_seq = 'X' * len(node.sequence)
+                    new_sequence = self.hallucination_expert.proteinmpnn.design_sequence(
+                        coordinates=coords,
+                        masked_sequence=masked_seq,
+                    )
+                    
+                    # Evaluate the new sequence with structure predictor
+                    new_structure_result = self.structure_predictor.predict_structure(new_sequence)
+                    new_coords = new_structure_result['coordinates']
+                    new_plddt = new_structure_result['confidence']
+                    new_mean_plddt = float(np.mean(new_plddt))
+                    
+                    candidate_sequences.append(new_sequence)
+                    candidate_data.append((new_sequence, new_coords, new_plddt, new_mean_plddt))
+                    
+                    print(f"      ✅ Candidate {len(candidate_sequences)}: pLDDT={new_mean_plddt:.1f}, seq={new_sequence[:20]}...")
                 
             except Exception as e:
                 print(f"      ❌ Rollout {rollout+1} failed: {e}")
                 import traceback
                 traceback.print_exc()
         
-        # Step 3: Compute sibling convergence (how similar are siblings to each other)
-        sibling_convergence = self.compute_sibling_convergence(sibling_sequences)
-        print(f"      👥 Sibling convergence: {sibling_convergence:.3f} (from {len(sibling_sequences)} siblings)")
+        # Step 3: Compute sibling convergence (how similar are candidates to each other)
+        sibling_convergence = self.compute_sibling_convergence(candidate_sequences)
+        print(f"      👥 Sibling convergence: {sibling_convergence:.3f} (from {len(candidate_sequences)} candidates)")
         
         # Step 4: Create child nodes with both convergence metrics
         children = []
-        for i, (seq, new_coords, new_plddt, new_mean_plddt) in enumerate(sibling_data):
+        for i, (seq, new_coords, new_plddt, new_mean_plddt) in enumerate(candidate_data):
             # Compute parent-child similarity (key convergence metric from papers)
             parent_child_sim = self.compute_sequence_similarity(node.sequence, seq)
             
@@ -452,6 +483,9 @@ def test_hallucination_mcts(
     num_iterations: int = 10,
     max_depth: int = 5,
     output_dir: Optional[str] = None,
+    structure_backend: str = "esmfold",
+    num_candidates: int = 2,
+    traj_mode: str = "default",
 ):
     """
     Test the hallucination MCTS design.
@@ -463,11 +497,15 @@ def test_hallucination_mcts(
         num_iterations: Number of MCTS iterations
         max_depth: Maximum tree depth
         output_dir: Directory to save PDB files
+        structure_backend: "esmfold" or "boltz" for structure prediction
+        num_candidates: K candidates per cycle (HalluDesign style)
+        traj_mode: "short", "long", "default" - for future AF3 truncated diffusion
     """
     print("\n" + "="*80)
     print(f"Test: Hallucination MCTS Design")
     print(f"  Length: {length}, Mock: {use_mock}, Init: {init_mode}")
     print(f"  Iterations: {num_iterations}, Max Depth: {max_depth}")
+    print(f"  Backend: {structure_backend}, K={num_candidates}, Traj: {traj_mode}")
     print("="*80 + "\n")
     
     # Create MCTS
@@ -479,6 +517,9 @@ def test_hallucination_mcts(
         use_mock=use_mock,
         init_mode=init_mode,
         output_dir=output_dir,
+        structure_backend=structure_backend,
+        num_candidates=num_candidates,
+        traj_mode=traj_mode,
     )
     
     # Run search
@@ -761,6 +802,12 @@ if __name__ == "__main__":
                         help="Initialization mode: random, all_a (alanine), all_g (glycine)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Directory to save PDB files (default: hallucination_outputs)")
+    parser.add_argument("--backend", choices=["esmfold", "boltz"], default="esmfold",
+                        help="Structure prediction backend: esmfold or boltz")
+    parser.add_argument("--num-candidates", type=int, default=2,
+                        help="K candidates per cycle (HalluDesign style multi-candidate selection)")
+    parser.add_argument("--traj-mode", choices=["short", "long", "default"], default="default",
+                        help="Trajectory mode for future AF3 truncated diffusion support")
     args = parser.parse_args()
     
     print("\n" + "="*80)
@@ -772,6 +819,7 @@ if __name__ == "__main__":
         print(f"\n🧪 Running Hallucination MCTS")
         print(f"   Length: {args.length}, Real: {args.real}, Init: {args.init_mode}")
         print(f"   Iterations: {args.iterations}, Max Depth: {args.max_depth}")
+        print(f"   Backend: {args.backend}, K={args.num_candidates}, Traj: {args.traj_mode}")
         
         best_node, mcts, path = test_hallucination_mcts(
             use_mock=not args.real, 
@@ -780,6 +828,9 @@ if __name__ == "__main__":
             num_iterations=args.iterations,
             max_depth=args.max_depth,
             output_dir=args.output_dir,
+            structure_backend=args.backend,
+            num_candidates=args.num_candidates,
+            traj_mode=args.traj_mode,
         )
         
         # Save results to JSON
