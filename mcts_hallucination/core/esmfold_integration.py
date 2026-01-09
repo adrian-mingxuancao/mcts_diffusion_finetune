@@ -77,7 +77,8 @@ class ESMFoldIntegration:
     
     def predict_structure(self, sequence: str) -> Dict:
         """Predict structure for a sequence using ESMFold."""
-        clean_sequence = sequence.replace("X", "A")
+        # clean_sequence = sequence.replace("X", "A")
+        clean_sequence = sequence
         
         if self.use_mock or self.model is None or self.tokenizer is None:
             return self._mock_predict(clean_sequence)
