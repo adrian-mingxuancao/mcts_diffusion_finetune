@@ -167,15 +167,16 @@ class HallucinationMCTS:
         Generate initial sequence based on init_mode.
         
         Modes:
-        - 'random': Random amino acid sequence
+        - 'random': Random amino acid sequence (HalluDesign style)
         - 'all_x': All X tokens (unknown) - used in Protein Hunter paper
+                   Boltz can handle X directly; ESMFold converts to A
         - 'all_a': All alanine - simple baseline
         - 'all_g': All glycine - minimal side chains
         """
         if self.init_mode == "all_x":
-            # Note: ESMFold doesn't handle X well, so we use a poly-alanine
-            # which is what X tokens get converted to anyway
-            return 'A' * length
+            # Boltz can handle X tokens directly for diffusion hallucination
+            # ESMFold will convert X to A internally
+            return 'X' * length
         elif self.init_mode == "all_a":
             return 'A' * length
         elif self.init_mode == "all_g":
@@ -798,8 +799,8 @@ if __name__ == "__main__":
                         help="Number of MCTS iterations")
     parser.add_argument("--max-depth", type=int, default=5,
                         help="Maximum tree depth")
-    parser.add_argument("--init-mode", choices=["random", "all_a", "all_g"], default="random",
-                        help="Initialization mode: random, all_a (alanine), all_g (glycine)")
+    parser.add_argument("--init-mode", choices=["random", "all_x", "all_a", "all_g"], default="random",
+                        help="Initialization mode: random (HalluDesign), all_x (Protein Hunter), all_a, all_g")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Directory to save PDB files (default: hallucination_outputs)")
     parser.add_argument("--backend", choices=["esmfold", "boltz"], default="esmfold",
