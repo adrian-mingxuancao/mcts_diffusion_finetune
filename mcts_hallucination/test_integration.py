@@ -20,6 +20,7 @@ import math
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 # Add paths
 sys.path.insert(0, '/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_diffusion_finetune')
@@ -50,6 +51,8 @@ class HallucinationNode:
     
     # Convergence tracking
     convergence_score: float = 0.0  # How similar to parent (higher = more converged)
+    parent_child_similarity: float = 0.0  # Similarity to parent sequence
+    sibling_convergence: float = 0.0  # Similarity among siblings
     
     def get_reward(self) -> float:
         """Average reward from visits."""
@@ -95,6 +98,8 @@ class HallucinationMCTS:
         exploration_constant: float = 1.414,
         use_mock: bool = False,
         device: str = "cuda",
+        init_mode: str = "random",  # "random" or "all_x" or "all_a"
+        output_dir: Optional[str] = None,  # Directory to save PDB files
     ):
         self.sequence_length = sequence_length
         self.max_depth = max_depth
@@ -103,6 +108,15 @@ class HallucinationMCTS:
         self.exploration_constant = exploration_constant
         self.use_mock = use_mock
         self.device = device
+        self.init_mode = init_mode
+        
+        # Setup output directory for PDB files
+        if output_dir:
+            self.output_dir = Path(output_dir)
+        else:
+            self.output_dir = Path("/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/hallucination_outputs")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.pdb_counter = 0
         
         # Initialize ESMFold
         print(f"🔧 Initializing ESMFold (mock={use_mock})...")
@@ -125,11 +139,62 @@ class HallucinationMCTS:
         print(f"   Max depth: {max_depth}")
         print(f"   Iterations: {num_iterations}")
         print(f"   Rollouts per expansion: {num_rollouts}")
+        print(f"   Init mode: {init_mode}")
+        print(f"   Output dir: {self.output_dir}")
     
-    def generate_random_sequence(self, length: int) -> str:
-        """Generate a random amino acid sequence."""
-        amino_acids = "ACDEFGHIKLMNPQRSTVWY"
-        return ''.join(random.choice(amino_acids) for _ in range(length))
+    def generate_initial_sequence(self, length: int) -> str:
+        """
+        Generate initial sequence based on init_mode.
+        
+        Modes:
+        - 'random': Random amino acid sequence
+        - 'all_x': All X tokens (unknown) - used in Protein Hunter paper
+        - 'all_a': All alanine - simple baseline
+        - 'all_g': All glycine - minimal side chains
+        """
+        if self.init_mode == "all_x":
+            # Note: ESMFold doesn't handle X well, so we use a poly-alanine
+            # which is what X tokens get converted to anyway
+            return 'A' * length
+        elif self.init_mode == "all_a":
+            return 'A' * length
+        elif self.init_mode == "all_g":
+            return 'G' * length
+        else:  # random
+            amino_acids = "ACDEFGHIKLMNPQRSTVWY"
+            return ''.join(random.choice(amino_acids) for _ in range(length))
+    
+    def save_pdb(self, sequence: str, coordinates: np.ndarray, iteration: int, 
+                 depth: int, node_id: int, plddt: float, suffix: str = "") -> str:
+        """
+        Save structure as PDB file for visualization.
+        
+        Returns the path to the saved PDB file.
+        """
+        self.pdb_counter += 1
+        filename = f"iter{iteration:03d}_depth{depth:02d}_node{node_id:04d}_plddt{plddt:.1f}{suffix}.pdb"
+        filepath = self.output_dir / filename
+        
+        # Write PDB file
+        with open(filepath, 'w') as f:
+            f.write(f"REMARK   1 Hallucination MCTS Design\n")
+            f.write(f"REMARK   2 Iteration: {iteration}, Depth: {depth}, Node: {node_id}\n")
+            f.write(f"REMARK   3 Sequence: {sequence}\n")
+            f.write(f"REMARK   4 Mean pLDDT: {plddt:.2f}\n")
+            
+            # Write CA atoms
+            for i, (aa, coord) in enumerate(zip(sequence, coordinates)):
+                # Convert 1-letter to 3-letter code
+                aa3 = {'A': 'ALA', 'C': 'CYS', 'D': 'ASP', 'E': 'GLU', 'F': 'PHE',
+                       'G': 'GLY', 'H': 'HIS', 'I': 'ILE', 'K': 'LYS', 'L': 'LEU',
+                       'M': 'MET', 'N': 'ASN', 'P': 'PRO', 'Q': 'GLN', 'R': 'ARG',
+                       'S': 'SER', 'T': 'THR', 'V': 'VAL', 'W': 'TRP', 'Y': 'TYR'}.get(aa, 'ALA')
+                
+                f.write(f"ATOM  {i+1:5d}  CA  {aa3} A{i+1:4d}    {coord[0]:8.3f}{coord[1]:8.3f}{coord[2]:8.3f}  1.00{plddt:6.2f}           C\n")
+            
+            f.write("END\n")
+        
+        return str(filepath)
     
     def compute_sequence_similarity(self, seq1: str, seq2: str) -> float:
         """Compute sequence identity between two sequences."""
@@ -157,17 +222,27 @@ class HallucinationMCTS:
         
         return total_sim / num_pairs if num_pairs > 0 else 0.0
     
-    def compute_convergence_reward(self, sibling_convergence: float, plddt: float) -> float:
+    def compute_convergence_reward(
+        self, 
+        sibling_convergence: float, 
+        parent_child_similarity: float,
+        plddt: float
+    ) -> float:
         """
-        Compute reward based on sibling convergence and structure quality.
+        Compute reward based on convergence metrics and structure quality.
         
-        Higher reward = siblings more similar (structure is consistent) + good pLDDT.
+        Based on Protein Hunter and HalluDesign papers:
+        - Parent-child similarity: Key metric - how much does the sequence change?
+          High similarity = converging to stable sequence-structure pair
+        - Sibling convergence: Structure consistency - does same structure produce similar seqs?
+        - pLDDT: Structure quality
         
-        R = 0.6 * sibling_convergence + 0.4 * normalized_plddt
+        R = 0.4 * parent_child_similarity + 0.3 * sibling_convergence + 0.3 * normalized_plddt
         """
         normalized_plddt = plddt / 100.0  # pLDDT is 0-100
         
-        reward = 0.6 * sibling_convergence + 0.4 * normalized_plddt
+        # Weight parent-child similarity more heavily - this is the key convergence metric
+        reward = 0.4 * parent_child_similarity + 0.3 * sibling_convergence + 0.3 * normalized_plddt
         return reward
     
     def expand_node(self, node: HallucinationNode) -> List[HallucinationNode]:
@@ -222,11 +297,14 @@ class HallucinationMCTS:
         sibling_convergence = self.compute_sibling_convergence(sibling_sequences)
         print(f"      👥 Sibling convergence: {sibling_convergence:.3f} (from {len(sibling_sequences)} siblings)")
         
-        # Step 4: Create child nodes with sibling convergence as the convergence score
+        # Step 4: Create child nodes with both convergence metrics
         children = []
         for i, (seq, new_coords, new_plddt, new_mean_plddt) in enumerate(sibling_data):
-            # Reward based on sibling convergence + individual pLDDT
-            reward = self.compute_convergence_reward(sibling_convergence, new_mean_plddt)
+            # Compute parent-child similarity (key convergence metric from papers)
+            parent_child_sim = self.compute_sequence_similarity(node.sequence, seq)
+            
+            # Reward based on both convergence metrics + pLDDT
+            reward = self.compute_convergence_reward(sibling_convergence, parent_child_sim, new_mean_plddt)
             
             child = HallucinationNode(
                 sequence=seq,
@@ -235,13 +313,15 @@ class HallucinationMCTS:
                 mean_plddt=new_mean_plddt,
                 parent=node,
                 depth=node.depth + 1,
-                convergence_score=sibling_convergence,  # All siblings share same convergence
+                convergence_score=parent_child_sim,  # Use parent-child as main convergence
+                parent_child_similarity=parent_child_sim,
+                sibling_convergence=sibling_convergence,
                 visits=1,
                 total_reward=reward,
             )
             children.append(child)
             
-            print(f"      📊 Child {i+1}: sibling_conv={sibling_convergence:.3f}, pLDDT={new_mean_plddt:.1f}, reward={reward:.3f}")
+            print(f"      📊 Child {i+1}: parent_sim={parent_child_sim:.3f}, sibling_conv={sibling_convergence:.3f}, pLDDT={new_mean_plddt:.1f}, reward={reward:.3f}")
         
         return children
     
@@ -271,16 +351,19 @@ class HallucinationMCTS:
         print("🚀 Starting Hallucination MCTS Search")
         print("="*80)
         
-        # Create root node with random sequence
-        random_seq = self.generate_random_sequence(self.sequence_length)
-        print(f"\n🌱 Root: Random sequence (length={len(random_seq)})")
-        print(f"   Sequence: {random_seq}")
+        # Create root node with initial sequence based on init_mode
+        initial_seq = self.generate_initial_sequence(self.sequence_length)
+        print(f"\n🌱 Root: {self.init_mode} sequence (length={len(initial_seq)})")
+        print(f"   Sequence: {initial_seq}")
         
         root = HallucinationNode(
-            sequence=random_seq,
+            sequence=initial_seq,
             depth=0,
             visits=1,
         )
+        
+        # Track node IDs for PDB saving
+        node_counter = 0
         
         # Run MCTS iterations
         best_node = root
@@ -298,20 +381,46 @@ class HallucinationMCTS:
                 children = self.expand_node(selected)
                 selected.children.extend(children)
                 
-                # Backpropagate for each child
+                # Backpropagate for each child and save PDB files
                 for child in children:
+                    node_counter += 1
                     self.backpropagate(child, child.get_reward())
+                    
+                    # Save PDB file for this child
+                    if child.coordinates is not None:
+                        pdb_path = self.save_pdb(
+                            sequence=child.sequence,
+                            coordinates=child.coordinates,
+                            iteration=iteration + 1,
+                            depth=child.depth,
+                            node_id=node_counter,
+                            plddt=child.mean_plddt,
+                        )
+                        print(f"   💾 Saved: {Path(pdb_path).name}")
                     
                     # Track best converged node
                     if child.convergence_score > best_convergence:
                         best_convergence = child.convergence_score
                         best_node = child
-                        print(f"   🏆 New best: convergence={best_convergence:.3f}, depth={child.depth}")
+                        print(f"   🏆 New best: parent_sim={best_convergence:.3f}, pLDDT={child.mean_plddt:.1f}, depth={child.depth}")
             
             # Check for convergence (>95% similarity)
             if best_convergence > 0.95:
-                print(f"\n✅ Converged! Sequence similarity > 95%")
+                print(f"\n✅ Converged! Parent-child similarity > 95%")
                 break
+        
+        # Save final best structure with special suffix
+        if best_node.coordinates is not None:
+            final_pdb = self.save_pdb(
+                sequence=best_node.sequence,
+                coordinates=best_node.coordinates,
+                iteration=self.num_iterations,
+                depth=best_node.depth,
+                node_id=9999,
+                plddt=best_node.mean_plddt,
+                suffix="_BEST",
+            )
+            print(f"\n💾 Best structure saved: {final_pdb}")
         
         return best_node
     
@@ -336,25 +445,40 @@ class HallucinationMCTS:
 # TEST FUNCTIONS
 # ============================================================================
 
-def test_hallucination_mcts(use_mock: bool = True, length: int = 50):
+def test_hallucination_mcts(
+    use_mock: bool = True, 
+    length: int = 50,
+    init_mode: str = "random",
+    num_iterations: int = 10,
+    max_depth: int = 5,
+    output_dir: Optional[str] = None,
+):
     """
     Test the hallucination MCTS design.
     
     Args:
         use_mock: Use mock models for testing (faster)
         length: Sequence length to test
+        init_mode: Initialization mode - "random", "all_a", "all_g"
+        num_iterations: Number of MCTS iterations
+        max_depth: Maximum tree depth
+        output_dir: Directory to save PDB files
     """
     print("\n" + "="*80)
-    print(f"Test: Hallucination MCTS Design (length={length}, mock={use_mock})")
+    print(f"Test: Hallucination MCTS Design")
+    print(f"  Length: {length}, Mock: {use_mock}, Init: {init_mode}")
+    print(f"  Iterations: {num_iterations}, Max Depth: {max_depth}")
     print("="*80 + "\n")
     
     # Create MCTS
     mcts = HallucinationMCTS(
         sequence_length=length,
-        max_depth=5,
-        num_iterations=10,
+        max_depth=max_depth,
+        num_iterations=num_iterations,
         num_rollouts=2,
         use_mock=use_mock,
+        init_mode=init_mode,
+        output_dir=output_dir,
     )
     
     # Run search
@@ -367,13 +491,15 @@ def test_hallucination_mcts(use_mock: bool = True, length: int = 50):
     print(f"\n🏆 Best converged node:")
     print(f"   Depth: {best_node.depth}")
     print(f"   Sequence: {best_node.sequence}")
-    print(f"   Convergence: {best_node.convergence_score:.3f}")
+    print(f"   Parent-Child Similarity: {best_node.parent_child_similarity:.3f}")
+    print(f"   Sibling Convergence: {best_node.sibling_convergence:.3f}")
     print(f"   Mean pLDDT: {best_node.mean_plddt:.1f}")
     print(f"   Visits: {best_node.visits}")
     print(f"   Avg Reward: {best_node.get_reward():.3f}")
+    print(f"   Output dir: {mcts.output_dir}")
     
     # Trace path from root
-    print(f"\n📈 Path from root:")
+    print(f"\n📈 Path from root (showing convergence evolution):")
     path = []
     node = best_node
     while node is not None:
@@ -383,9 +509,9 @@ def test_hallucination_mcts(use_mock: bool = True, length: int = 50):
     
     for i, n in enumerate(path):
         if i == 0:
-            print(f"   Depth {n.depth}: {n.sequence[:30]}... (root)")
+            print(f"   Depth {n.depth}: {n.sequence[:30]}... (root, init_mode={mcts.init_mode})")
         else:
-            print(f"   Depth {n.depth}: {n.sequence[:30]}... (conv={n.convergence_score:.3f}, pLDDT={n.mean_plddt:.1f})")
+            print(f"   Depth {n.depth}: {n.sequence[:30]}... (parent_sim={n.parent_child_similarity:.3f}, sibling={n.sibling_convergence:.3f}, pLDDT={n.mean_plddt:.1f})")
     
     return best_node, mcts, path
 
@@ -428,7 +554,9 @@ def save_results_to_json(
             "depth": node.depth,
             "sequence": node.sequence,
             "mean_plddt": float(node.mean_plddt) if node.mean_plddt else None,
-            "sibling_convergence": float(node.convergence_score),
+            "parent_child_similarity": float(node.parent_child_similarity),
+            "sibling_convergence": float(node.sibling_convergence),
+            "convergence_score": float(node.convergence_score),
             "visits": node.visits,
             "total_reward": float(node.total_reward),
             "avg_reward": float(node.get_reward()),
@@ -455,9 +583,12 @@ def save_results_to_json(
             "num_iterations": mcts.num_iterations,
             "num_rollouts": mcts.num_rollouts,
             "use_mock": mcts.use_mock,
+            "init_mode": mcts.init_mode,
+            "output_dir": str(mcts.output_dir),
             "total_nodes": len(nodes_data),
             "best_node_id": node_id_map.get(id(path[-1])) if path else None,
-            "best_convergence": float(path[-1].convergence_score) if path else 0.0,
+            "best_parent_child_similarity": float(path[-1].parent_child_similarity) if path else 0.0,
+            "best_sibling_convergence": float(path[-1].sibling_convergence) if path else 0.0,
             "best_plddt": float(path[-1].mean_plddt) if path and path[-1].mean_plddt else None,
         },
         "nodes": nodes_data,
@@ -624,6 +755,12 @@ if __name__ == "__main__":
                         help="Use real models (requires GPU)")
     parser.add_argument("--iterations", type=int, default=10,
                         help="Number of MCTS iterations")
+    parser.add_argument("--max-depth", type=int, default=5,
+                        help="Maximum tree depth")
+    parser.add_argument("--init-mode", choices=["random", "all_a", "all_g"], default="random",
+                        help="Initialization mode: random, all_a (alanine), all_g (glycine)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Directory to save PDB files (default: hallucination_outputs)")
     args = parser.parse_args()
     
     print("\n" + "="*80)
@@ -632,12 +769,23 @@ if __name__ == "__main__":
     
     if args.test in ["mcts", "all"]:
         # Test hallucination MCTS
-        print(f"\n🧪 Running Hallucination MCTS (length={args.length}, mock={not args.real})")
-        best_node, mcts, path = test_hallucination_mcts(use_mock=not args.real, length=args.length)
+        print(f"\n🧪 Running Hallucination MCTS")
+        print(f"   Length: {args.length}, Real: {args.real}, Init: {args.init_mode}")
+        print(f"   Iterations: {args.iterations}, Max Depth: {args.max_depth}")
+        
+        best_node, mcts, path = test_hallucination_mcts(
+            use_mock=not args.real, 
+            length=args.length,
+            init_mode=args.init_mode,
+            num_iterations=args.iterations,
+            max_depth=args.max_depth,
+            output_dir=args.output_dir,
+        )
         
         # Save results to JSON
         save_results_to_json(mcts, path)
         print(f"\n✅ MCTS test completed!")
+        print(f"   PDB files saved to: {mcts.output_dir}")
     
     if args.test in ["expert", "all"]:
         # Test standalone expert
