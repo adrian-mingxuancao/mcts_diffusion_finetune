@@ -68,10 +68,22 @@ Comparison of different initialization modes and backends for 100aa protein hall
    - Secondary: **scTM** (self-consistent TM-score via refolding)
    - NOT parent-child sequence similarity
 
+## Known Issue: Single Helix Collapse
+
+All high-pLDDT structures tend to collapse to **single alpha helices**:
+- End-to-end distance: ~150 Å (expected for 100aa helix)
+- Radius of gyration: ~44 Å
+- CA-CA distance: 3.80 Å (perfect helix geometry)
+
+This is a known limitation of ProteinMPNN + Boltz hallucination - helices are the most "designable" topology. Future work may need:
+- Topology constraints
+- Secondary structure guidance
+- Multi-chain designs
+- Reward shaping to penalize extended structures
+
 ## Directory Structure
 
-- `all_x_init_boltz/` - Results from all-X initialization with Boltz (full masking)
-- `all_x_init_boltz_inherit_seq/` - Results with sequence inheritance (ProteinHunter-style)
+- `all_x_init_boltz/` - Results from all-X initialization with Boltz (inherit_seq masking)
 - `random_init_boltz/` - Results from random sequence initialization with Boltz
 - `all_x_init_esmfold/` - Results from all-X initialization with ESMFold
 - `random_init_esmfold/` - Results from random sequence initialization with ESMFold
