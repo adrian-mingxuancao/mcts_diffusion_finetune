@@ -303,7 +303,8 @@ class HallucinationMCTS:
             try:
                 # Generate K sequences per rollout
                 for k in range(self.num_candidates):
-                    masked_seq = 'X' * len(node.sequence)
+                    # Inherit the full parent sequence without masking (ProteinHunter-style).
+                    masked_seq = node.sequence
                     new_sequence = self.hallucination_expert.proteinmpnn.design_sequence(
                         coordinates=coords,
                         masked_sequence=masked_seq,
