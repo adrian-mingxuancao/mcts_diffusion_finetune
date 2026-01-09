@@ -6,7 +6,7 @@ from masked sequences in the hallucination pipeline.
 
 Supports:
 - AF3 via ABCFold CLI
-- Boltz via boltz CLI (with --no_kernels for compatibility)
+- Boltz via boltz CLI
 - Chai-1 via direct Python API (chai_lab.chai1)
 """
 
@@ -100,7 +100,7 @@ class ABCFoldIntegration:
         Real prediction using the appropriate backend.
         
         Routes to:
-        - Boltz: Direct CLI with --no_kernels flag
+        - Boltz: Direct CLI
         - Chai-1: Direct Python API
         - AF3: ABCFold CLI
         """
@@ -136,7 +136,6 @@ class ABCFoldIntegration:
                 str(fasta_path),
                 "--out_dir", str(output_dir),
                 "--use_msa_server",
-                "--no_kernels",  # Required for CUDA compatibility
                 "--override",
                 "--recycling_steps", str(num_recycles),
             ]

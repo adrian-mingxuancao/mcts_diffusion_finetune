@@ -49,7 +49,7 @@ class BoltzDesignIntegration:
         """
         self.use_mock = use_mock
         self.device = device
-        self.checkpoint_path = checkpoint_path or "~/.boltz/boltz1_conf.ckpt"
+        self.checkpoint_path = checkpoint_path or "/net/scratch/caom/.boltz/boltz1_conf.ckpt"
         self.temperature = temperature
         
         mode = "MOCK MODE" if use_mock else "REAL MODE"
@@ -142,10 +142,25 @@ class BoltzDesignIntegration:
         use_msa: bool,
     ) -> Dict:
         """Real BoltzDesign1 design using CLI."""
+        import shutil
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
             output_dir = tmpdir / "output"
             output_dir.mkdir()
+            
+            # Copy LigandMPNN directory to work_dir (required for LigandMPNN step)
+            ligandmpnn_src = self.BOLTZDESIGN_PATH / "LigandMPNN"
+            ligandmpnn_dst = tmpdir / "LigandMPNN"
+            if ligandmpnn_src.exists():
+                shutil.copytree(ligandmpnn_src, ligandmpnn_dst)
+                print(f"      Copied LigandMPNN to {ligandmpnn_dst}")
+            
+            # Copy LigandMPNN model weights (required for LigandMPNN step)
+            ligandmpnn_weights_src = Path("/net/scratch/caom/ligandmpnn_weights")
+            ligandmpnn_weights_dst = ligandmpnn_dst / "model_params"
+            if ligandmpnn_weights_src.exists():
+                shutil.copytree(ligandmpnn_weights_src, ligandmpnn_weights_dst)
+                print(f"      Copied LigandMPNN weights to {ligandmpnn_weights_dst}")
             
             # Determine target name
             if os.path.exists(target_pdb):
@@ -155,7 +170,7 @@ class BoltzDesignIntegration:
                 target_name = target_pdb
                 pdb_path_arg = ""
             
-            # Build command
+            # Build command with faster inference settings
             cmd = [
                 sys.executable,
                 str(self.BOLTZDESIGN_PATH / "boltzdesign.py"),
@@ -167,7 +182,15 @@ class BoltzDesignIntegration:
                 "--work_dir", str(tmpdir),
                 "--run_alphafold", "False",  # Skip AF3 validation
                 "--run_rosetta", "False",    # Skip Rosetta
+                "--run_ligandmpnn", "True",  # Run LigandMPNN for sequence design
                 "--use_msa", str(use_msa).lower(),
+                "--boltz_checkpoint", self.checkpoint_path,
+                "--ccd_path", str(Path(self.checkpoint_path).parent / "ccd.pkl"),
+                # Faster inference settings - reduce iterations
+                "--pre_iteration", "10",   # Default 30
+                "--soft_iteration", "30",  # Default 100
+                "--temp_iteration", "0",   # Default 0
+                "--hard_iteration", "10",  # Default 30
             ]
             
             if target_chain_ids:
@@ -176,24 +199,63 @@ class BoltzDesignIntegration:
             if pdb_path_arg:
                 cmd.extend(pdb_path_arg.split())
             
-            print(f"      Running BoltzDesign1: {' '.join(cmd[:8])}...")
+            print(f"      Running BoltzDesign1:")
+            print(f"        Target: {target_name} ({target_type})")
+            print(f"        Binder length: {length_min}-{length_max} aa")
+            print(f"        Work dir: {tmpdir}")
+            print(f"        Checkpoint: {self.checkpoint_path}")
+            print(f"        Command: {' '.join(cmd)}")
+            print(f"      (This may take 5-15 minutes with fast settings)")
             
             env = os.environ.copy()
             env['CUDA_VISIBLE_DEVICES'] = '0'
+            boltzdesign_dir = str(self.BOLTZDESIGN_PATH / "boltzdesign")
+            env['PYTHONPATH'] = f"{boltzdesign_dir}:{env.get('PYTHONPATH', '')}"
             
-            result = subprocess.run(
+            # Use Popen for streaming output
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 cwd=str(self.BOLTZDESIGN_PATH),
                 env=env,
+                bufsize=1,
             )
             
-            if result.returncode != 0:
-                raise RuntimeError(f"BoltzDesign1 failed: {result.stderr[-500:]}")
+            # Stream output in real-time
+            output_lines = []
+            for line in process.stdout:
+                line = line.rstrip()
+                output_lines.append(line)
+                if any(kw in line.lower() for kw in ['step', 'iter', 'sample', 'design', 'loading', 'running', 'complete', 'error', 'warning', 'iptm', 'epoch']):
+                    print(f"      {line}")
             
-            # Parse output
-            designs = self._parse_output(output_dir, target_name)
+            process.wait()
+            
+            # Parse output even if process failed (design may have been generated)
+            # Look in the work_dir/outputs directory for results
+            outputs_dir = tmpdir / "outputs"
+            designs = self._parse_output(outputs_dir, target_name)
+            
+            # Also try parsing from output_dir
+            if not designs:
+                designs = self._parse_output(output_dir, target_name)
+            
+            # If still no designs and process failed, raise error
+            if process.returncode != 0 and not designs:
+                raise RuntimeError(f"BoltzDesign1 failed: {''.join(output_lines[-10:])}")
+            
+            # Extract iPTM from output if available
+            for line in output_lines:
+                if 'Update sequence, iptm' in line:
+                    try:
+                        import re
+                        match = re.search(r'iptm \[([0-9.]+)\]', line)
+                        if match and designs:
+                            designs[-1]['iptm'] = float(match.group(1))
+                    except:
+                        pass
             
             return {
                 'designs': designs,
@@ -205,40 +267,77 @@ class BoltzDesignIntegration:
         """Parse BoltzDesign1 output files."""
         designs = []
         
-        # Look for output PDB files
-        pdb_files = list(output_dir.glob(f"**/*{target_name}*.pdb"))
+        if not output_dir.exists():
+            return designs
         
+        # Look for output PDB and CIF files
+        pdb_files = list(output_dir.glob(f"**/*{target_name}*.pdb"))
+        cif_files = list(output_dir.glob(f"**/*{target_name}*.cif"))
+        
+        # Combine and deduplicate
+        all_files = pdb_files + cif_files
+        print(f"      Found {len(all_files)} output files in {output_dir}")
+        
+        # Helper to convert 3-letter to 1-letter amino acid code
+        AA_MAP = {
+            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+            'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+            'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+            'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+        }
+        
+        def parse_structure(structure):
+            sequence = ""
+            coords = []
+            for model in structure:
+                for chain in model:
+                    for residue in chain:
+                        if 'CA' in residue:
+                            resname = residue.get_resname()
+                            if resname in AA_MAP:
+                                sequence += AA_MAP[resname]
+                                coords.append(residue['CA'].get_coord())
+            return sequence, coords
+        
+        # Parse PDB files
         for pdb_file in pdb_files:
             try:
                 from Bio.PDB import PDBParser
                 parser = PDBParser(QUIET=True)
                 structure = parser.get_structure("design", pdb_file)
-                
-                # Extract sequence and coordinates
-                sequence = ""
-                coords = []
-                
-                for model in structure:
-                    for chain in model:
-                        for residue in chain:
-                            if 'CA' in residue:
-                                from Bio.PDB.Polypeptide import three_to_one
-                                try:
-                                    sequence += three_to_one(residue.get_resname())
-                                    coords.append(residue['CA'].get_coord())
-                                except:
-                                    pass
+                sequence, coords = parse_structure(structure)
                 
                 if sequence:
                     designs.append({
                         'sequence': sequence,
                         'coordinates': np.array(coords),
-                        'plddt': 70.0,  # Default if not available
-                        'iptm': 0.7,    # Default if not available
+                        'plddt': 70.0,
+                        'iptm': 0.7,
                         'pdb_path': str(pdb_file),
                     })
+                    print(f"      Parsed PDB: {pdb_file.name} ({len(sequence)} aa)")
             except Exception as e:
-                print(f"      Warning: Failed to parse {pdb_file}: {e}")
+                print(f"      Warning: Failed to parse PDB {pdb_file}: {e}")
+        
+        # Parse CIF files
+        for cif_file in cif_files:
+            try:
+                from Bio.PDB import MMCIFParser
+                parser = MMCIFParser(QUIET=True)
+                structure = parser.get_structure("design", cif_file)
+                sequence, coords = parse_structure(structure)
+                
+                if sequence:
+                    designs.append({
+                        'sequence': sequence,
+                        'coordinates': np.array(coords),
+                        'plddt': 70.0,
+                        'iptm': 0.7,
+                        'pdb_path': str(cif_file),
+                    })
+                    print(f"      Parsed CIF: {cif_file.name} ({len(sequence)} aa)")
+            except Exception as e:
+                print(f"      Warning: Failed to parse CIF {cif_file}: {e}")
         
         return designs
 

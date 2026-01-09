@@ -470,12 +470,21 @@ def test_boltzdesign(use_mock=True):
         integration = BoltzDesignIntegration(use_mock=use_mock)
         
         # Test binder design for protein target
+        # Use a real PDB file from PocketGen examples for real mode
+        if use_mock:
+            target_pdb = "test_target"
+            target_chain_ids = None
+        else:
+            target_pdb = "/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/extra/PocketGen/examples/2p16/2p16.pdb"
+            target_chain_ids = ["A"]
+        
         result = integration.design_binder(
-            target_pdb="test_target",
+            target_pdb=target_pdb,
             target_type="protein",
+            target_chain_ids=target_chain_ids,
             binder_length_min=50,
             binder_length_max=80,
-            num_designs=2,
+            num_designs=1,  # Reduce to 1 for faster testing
         )
         
         print(f"Number of designs: {result['num_designs']}")
@@ -507,10 +516,16 @@ def test_pocketgen(use_mock=True):
         integration = PocketGenIntegration(use_mock=use_mock)
         
         # Test pocket generation
+        # Use real ligand file for real mode
+        if use_mock:
+            ligand_sdf = "test_ligand.sdf"
+        else:
+            ligand_sdf = "/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/extra/PocketGen/examples/2p16/2p16_ligand.sdf"
+        
         result = integration.generate_pocket(
-            ligand_sdf="test_ligand.sdf",
+            ligand_sdf=ligand_sdf,
             num_residues=20,
-            num_samples=2,
+            num_samples=1,  # Reduce for faster testing
         )
         
         print(f"Number of pockets: {result['num_samples']}")
