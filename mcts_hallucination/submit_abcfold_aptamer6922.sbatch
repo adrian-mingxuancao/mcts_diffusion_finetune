@@ -30,9 +30,9 @@ set -euo pipefail
 CONDA_ENV="${CONDA_ENV:-/net/scratch/caom/hallucination_env}"
 PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(dirname $(realpath $0))}"
 
-# Create timestamped results directory
+# Create timestamped results directory with backend name
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULTS_DIR="${PROJECT_ROOT}/results/abcfold_aptamer_6922_vs_6927/${TIMESTAMP}"
+RESULTS_DIR="${PROJECT_ROOT}/results/abcfold_aptamer_6922_vs_6927/${BACKEND}_${TIMESTAMP}"
 
 # Aptamer sequences (80-nt DNA)
 APTAMER_6922="TGCGTATTGACACATGCGTGCATACGGACATGATGGCGAACCCGGCTTGAGTTCTTTGGGTGAGTCCGAATTTTGGAGCG"
@@ -42,7 +42,10 @@ APTAMER_6927="TGCGTATTGACACATGCGTGTAGGGGTACCAACTGTCACTGCCAATTTTGCCACTTGCTCTGAGTC
 PROTEINS=("6D0L" "6CO2" "3COU")
 PROTEIN_NAMES=("TIRR" "Nudt16TI" "Nudt16")
 
-# Boltz parameters
+# Backend selection: "boltz" or "chai"
+BACKEND="${BACKEND:-boltz}"
+
+# Prediction parameters
 RECYCLING_STEPS="${RECYCLING_STEPS:-3}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-1800}"
 
@@ -82,12 +85,23 @@ fi
 echo "Python: $(which python)"
 python -V
 
-# Verify boltz is available
-if ! command -v boltz &>/dev/null; then
-    echo "ERROR: boltz command not found. Please install boltz or activate correct environment."
+# Verify backend is available
+if [[ "${BACKEND}" == "boltz" ]]; then
+    if ! command -v boltz &>/dev/null; then
+        echo "ERROR: boltz command not found. Please install boltz or activate correct environment."
+        exit 1
+    fi
+    echo "Backend: Boltz ($(which boltz))"
+elif [[ "${BACKEND}" == "chai" ]]; then
+    if ! python3 -c "from chai_lab.chai1 import run_inference" 2>/dev/null; then
+        echo "ERROR: chai_lab not found. Please install chai-lab or activate correct environment."
+        exit 1
+    fi
+    echo "Backend: Chai-1 (Python API)"
+else
+    echo "ERROR: Unknown backend '${BACKEND}'. Use 'boltz' or 'chai'."
     exit 1
 fi
-echo "Boltz: $(which boltz)"
 
 # Set cache directories
 export XDG_CACHE_HOME="/net/scratch/caom/.cache"
@@ -174,7 +188,7 @@ METRICS_FILE="${RESULTS_DIR}/summary/metrics.csv"
 echo "task_name,target,top_model_confidence,runtime_seconds,notes" > "${METRICS_FILE}"
 
 # -------------------------
-# Helper function: Run Boltz and extract results
+# Helper function: Run Boltz prediction
 # -------------------------
 run_boltz_prediction() {
     local fasta_file="$1"
@@ -187,7 +201,7 @@ run_boltz_prediction() {
     local confidence="0.0"
     
     echo ""
-    echo "--- ${task_name} ---"
+    echo "--- ${task_name} (Boltz) ---"
     echo "  FASTA: ${fasta_file}"
     echo "  Output: ${output_dir}"
     
@@ -262,6 +276,120 @@ print(f'{np.mean(bfactors):.2f}' if bfactors else '0.0')
 }
 
 # -------------------------
+# Helper function: Run Chai-1 prediction
+# -------------------------
+run_chai_prediction() {
+    local fasta_file="$1"
+    local output_dir="$2"
+    local task_name="$3"
+    local target="${4:-none}"
+    
+    local start_time=$(date +%s)
+    local notes=""
+    local confidence="0.0"
+    
+    echo ""
+    echo "--- ${task_name} (Chai-1) ---"
+    echo "  FASTA: ${fasta_file}"
+    echo "  Output: ${output_dir}"
+    
+    # Run Chai-1 via Python
+    set +e
+    python3 << PYEOF
+import sys
+import os
+from pathlib import Path
+
+# Set output directory
+output_dir = Path("${output_dir}")
+fasta_file = Path("${fasta_file}")
+
+try:
+    from chai_lab.chai1 import run_inference
+    
+    # Run inference
+    print("  Running Chai-1 inference...")
+    candidates = run_inference(
+        fasta_file=fasta_file,
+        output_dir=output_dir / "chai_output",
+        num_trunk_recycles=${RECYCLING_STEPS},
+        num_diffn_timesteps=200,
+        seed=42,
+        device='cuda:0',
+        use_esm_embeddings=True,
+    )
+    
+    # Copy best model
+    if candidates.cif_paths:
+        import shutil
+        best_cif = candidates.cif_paths[0]
+        shutil.copy(best_cif, output_dir / "best_model.cif")
+        print(f"  Saved: best_model.cif")
+        
+        # Extract pLDDT from structure
+        from Bio.PDB import MMCIFParser
+        import numpy as np
+        parser = MMCIFParser(QUIET=True)
+        structure = parser.get_structure('s', best_cif)
+        bfactors = [atom.bfactor for atom in structure.get_atoms()]
+        if bfactors:
+            mean_plddt = np.mean(bfactors)
+            print(f"  Mean pLDDT: {mean_plddt:.2f}")
+            with open(output_dir / "plddt.txt", 'w') as f:
+                f.write(f"{mean_plddt:.2f}")
+        
+        # Save scores if available
+        if hasattr(candidates, 'scores') and candidates.scores:
+            import json
+            with open(output_dir / "scores.json", 'w') as f:
+                json.dump({'scores': [float(s) for s in candidates.scores]}, f)
+        
+        sys.exit(0)
+    else:
+        print("  ERROR: Chai-1 produced no structures")
+        sys.exit(1)
+        
+except Exception as e:
+    print(f"  ERROR: Chai-1 failed: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+PYEOF
+    local exit_code=$?
+    set -e
+    
+    local end_time=$(date +%s)
+    local runtime=$((end_time - start_time))
+    
+    if [[ ${exit_code} -ne 0 ]]; then
+        notes="FAILED: exit_code=${exit_code}"
+        echo "  ERROR: Chai-1 failed (exit ${exit_code})"
+    else
+        # Read pLDDT from file
+        if [[ -f "${output_dir}/plddt.txt" ]]; then
+            confidence=$(cat "${output_dir}/plddt.txt")
+        fi
+        notes="success"
+    fi
+    
+    # Append to metrics
+    echo "${task_name},${target},${confidence},${runtime},${notes}" >> "${METRICS_FILE}"
+    
+    echo "  Runtime: ${runtime}s"
+}
+
+# -------------------------
+# Unified prediction function (selects backend)
+# -------------------------
+run_prediction() {
+    if [[ "${BACKEND}" == "boltz" ]]; then
+        run_boltz_prediction "$@"
+    elif [[ "${BACKEND}" == "chai" ]]; then
+        run_chai_prediction "$@"
+    fi
+}
+
+# -------------------------
 # Task 1: Aptamer-only folding
 # -------------------------
 echo ""
@@ -269,24 +397,36 @@ echo "==========================================================================
 echo "Task 1: Aptamer-only tertiary structure prediction"
 echo "============================================================================"
 
-# Create Boltz-format FASTA for aptamer-only (single chain)
-cat > "${RESULTS_DIR}/aptamer_only/6922/input.fasta" << EOF
+# Create FASTA for aptamer-only (single chain)
+# Boltz format: >CHAIN_ID|entity_type
+# Chai format: >entity_type|name=...
+if [[ "${BACKEND}" == "boltz" ]]; then
+    cat > "${RESULTS_DIR}/aptamer_only/6922/input.fasta" << EOF
 >A|dna
 ${APTAMER_6922}
 EOF
-
-cat > "${RESULTS_DIR}/aptamer_only/6927/input.fasta" << EOF
+    cat > "${RESULTS_DIR}/aptamer_only/6927/input.fasta" << EOF
 >A|dna
 ${APTAMER_6927}
 EOF
+elif [[ "${BACKEND}" == "chai" ]]; then
+    cat > "${RESULTS_DIR}/aptamer_only/6922/input.fasta" << EOF
+>dna|name=aptamer_6922
+${APTAMER_6922}
+EOF
+    cat > "${RESULTS_DIR}/aptamer_only/6927/input.fasta" << EOF
+>dna|name=aptamer_6927
+${APTAMER_6927}
+EOF
+fi
 
-run_boltz_prediction \
+run_prediction \
     "${RESULTS_DIR}/aptamer_only/6922/input.fasta" \
     "${RESULTS_DIR}/aptamer_only/6922" \
     "aptamer_6922_only" \
     "none"
 
-run_boltz_prediction \
+run_prediction \
     "${RESULTS_DIR}/aptamer_only/6927/input.fasta" \
     "${RESULTS_DIR}/aptamer_only/6927" \
     "aptamer_6927_only" \
@@ -341,15 +481,26 @@ for i in "${!PROTEINS[@]}"; do
     
     echo "  Protein sequence length: ${#protein_seq}"
     
-    # Create multi-chain FASTA for Boltz (protein + DNA)
-    cat > "${complex_dir}/input.fasta" << EOF
+    # Create multi-chain FASTA (protein + DNA)
+    # Boltz format: >CHAIN_ID|entity_type
+    # Chai format: >entity_type|name=...
+    if [[ "${BACKEND}" == "boltz" ]]; then
+        cat > "${complex_dir}/input.fasta" << EOF
 >A|protein
 ${protein_seq}
 >B|dna
 ${APTAMER_6922}
 EOF
+    elif [[ "${BACKEND}" == "chai" ]]; then
+        cat > "${complex_dir}/input.fasta" << EOF
+>protein|name=${pdb}
+${protein_seq}
+>dna|name=aptamer_6922
+${APTAMER_6922}
+EOF
+    fi
     
-    run_boltz_prediction \
+    run_prediction \
         "${complex_dir}/input.fasta" \
         "${complex_dir}" \
         "aptamer_6922_${pdb}" \

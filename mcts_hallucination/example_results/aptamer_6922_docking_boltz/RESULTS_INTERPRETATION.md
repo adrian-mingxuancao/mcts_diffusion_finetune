@@ -1,8 +1,9 @@
-# DNA Aptamer 6922 Structure Prediction & Docking Results
+# DNA Aptamer 6922 Structure Prediction & Docking Results (Boltz)
 
 ## Task: All-atom tertiary structure prediction and predicted docking of a known 80-nucleotide DNA aptamer to small proteins of known structure
 
 **Status: ✅ WORKING**
+**Backend: Boltz (diffusion-based)**
 
 ## Summary
 

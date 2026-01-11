@@ -1,0 +1,6 @@
+task_name,target,top_model_confidence,runtime_seconds,notes
+aptamer_6922_only,none,56.13,80,success
+aptamer_6927_only,none,55.25,73,success
+aptamer_6922_6D0L,6D0L,68.67,305,success
+aptamer_6922_6CO2,6CO2,66.92,106,success
+aptamer_6922_3COU,3COU,67.83,105,success

@@ -4,12 +4,30 @@ This directory contains example results from two main pipelines:
 
 ## 1. DNA Aptamer Results (NEW)
 
-### Task A: Known Aptamer Docking (`aptamer_6922_docking/`)
+### Task A: Known Aptamer Docking
 **All-atom tertiary structure prediction and predicted docking of a known 80-nucleotide DNA aptamer to small proteins of known structure.**
 
+#### Boltz Backend (`aptamer_6922_docking_boltz/`)
 - **Status**: ✅ WORKING
 - **Best Result**: Aptamer 6922 + TIRR complex with pLDDT = 65.22
-- See `aptamer_6922_docking/RESULTS_INTERPRETATION.md` for details
+- See `aptamer_6922_docking_boltz/RESULTS_INTERPRETATION.md` for details
+
+#### Chai-1 Backend (`aptamer_6922_docking_chai/`)
+- **Status**: ✅ WORKING
+- **Best Result**: Aptamer 6922 + TIRR complex with pLDDT = 68.67
+- See `aptamer_6922_docking_chai/RESULTS_INTERPRETATION.md` for details
+
+#### Backend Comparison (Task A)
+
+| Task | Boltz pLDDT | Chai-1 pLDDT | Winner |
+|------|-------------|--------------|--------|
+| Aptamer 6922 only | 40.58 | 56.13 | **Chai-1** |
+| Aptamer 6927 only | 48.05 | 55.25 | **Chai-1** |
+| 6922 + TIRR (6D0L) | 65.22 | 68.67 | **Chai-1** |
+| 6922 + Nudt16TI (6CO2) | 64.20 | 66.92 | **Chai-1** |
+| 6922 + Nudt16 (3COU) | 62.01 | 67.83 | **Chai-1** |
+
+**Conclusion**: Chai-1 consistently outperforms Boltz for DNA aptamer structure prediction.
 
 ### Task B: De Novo Aptamer Design (`aptamer_denovo_design/`)
 **De novo predicted DNA aptamer sequences and all-atom tertiary structures and docked all-atom models for cell-surface target proteins.**
