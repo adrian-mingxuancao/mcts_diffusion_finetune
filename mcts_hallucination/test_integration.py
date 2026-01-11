@@ -28,6 +28,13 @@ sys.path.insert(0, '/home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucinat
 
 from core.hallucination_expert import create_hallucination_expert
 from core.esmfold_integration import ESMFoldIntegration
+from core.ss_guidance import (
+    SSGuidanceConfig,
+    SSGuidance,
+    DSSPResult,
+    EditLogEntry,
+    create_run_directory,
+)
 
 
 # ============================================================================
@@ -103,6 +110,8 @@ class HallucinationMCTS:
         structure_backend: str = "esmfold",  # "esmfold" or "boltz"
         num_candidates: int = 2,  # K candidates per cycle (HalluDesign style)
         traj_mode: str = "default",  # "short", "long", "default" - for future AF3 truncated diffusion
+        ss_guidance_config: Optional[SSGuidanceConfig] = None,  # SS guidance configuration
+        seed: Optional[int] = None,  # Random seed for reproducibility
     ):
         self.sequence_length = sequence_length
         self.max_depth = max_depth
@@ -151,6 +160,28 @@ class HallucinationMCTS:
             use_real_proteinmpnn=not use_mock,
         )
         
+        # Initialize SS guidance
+        self.ss_guidance_config = ss_guidance_config or SSGuidanceConfig()
+        self.ss_guidance = SSGuidance(self.ss_guidance_config) if self.ss_guidance_config.ss_guidance != "none" else None
+        self.seed = seed
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+        
+        # Create run directory for SS guidance artifacts
+        if self.ss_guidance and self.ss_guidance_config.ss_guidance != "none":
+            self.run_dir = create_run_directory(self.ss_guidance_config, seed)
+            print(f"   SS guidance: {self.ss_guidance_config.ss_guidance}")
+            print(f"   Run dir: {self.run_dir}")
+        else:
+            self.run_dir = None
+        
+        # Override init_mode based on SS guidance variant
+        if self.ss_guidance_config.ss_guidance == "beta_lock_reinit_helix":
+            self.init_mode = "random"  # Variant 1 uses random init
+        elif self.ss_guidance_config.ss_guidance in ("x_init_helix_pg", "x_init_beta_template", "x_init_ligand_first"):
+            self.init_mode = "all_x"  # Variants 2-4 use all_x init
+        
         print(f"✅ HallucinationMCTS initialized")
         print(f"   Sequence length: {sequence_length}")
         print(f"   Max depth: {max_depth}")
@@ -161,6 +192,7 @@ class HallucinationMCTS:
         print(f"   Num candidates (K): {num_candidates}")
         print(f"   Traj mode: {traj_mode}")
         print(f"   Output dir: {self.output_dir}")
+        print(f"   SS guidance: {self.ss_guidance_config.ss_guidance}")
     
     def generate_initial_sequence(self, length: int) -> str:
         """
@@ -217,6 +249,65 @@ class HallucinationMCTS:
         
         return str(filepath)
     
+    def _save_pdb_for_dssp(self, sequence: str, coordinates: np.ndarray, 
+                           plddt_scores: np.ndarray, filepath: str):
+        """
+        Save a proper PDB file for DSSP analysis.
+        
+        DSSP requires full backbone atoms (N, CA, C, O) for SS assignment.
+        This creates a minimal but valid PDB with backbone atoms.
+        """
+        aa3_map = {
+            'A': 'ALA', 'C': 'CYS', 'D': 'ASP', 'E': 'GLU', 'F': 'PHE',
+            'G': 'GLY', 'H': 'HIS', 'I': 'ILE', 'K': 'LYS', 'L': 'LEU',
+            'M': 'MET', 'N': 'ASN', 'P': 'PRO', 'Q': 'GLN', 'R': 'ARG',
+            'S': 'SER', 'T': 'THR', 'V': 'VAL', 'W': 'TRP', 'Y': 'TYR',
+            'X': 'UNK'
+        }
+        
+        with open(filepath, 'w') as f:
+            f.write(f"REMARK   1 Structure for DSSP analysis\n")
+            atom_num = 1
+            
+            for i, (aa, ca_coord) in enumerate(zip(sequence, coordinates)):
+                aa3 = aa3_map.get(aa, 'ALA')
+                plddt = float(plddt_scores[i]) if i < len(plddt_scores) else 50.0
+                res_num = i + 1
+                
+                # Generate approximate backbone atoms from CA position
+                # N is ~1.46 Å from CA along -x direction (simplified)
+                # C is ~1.52 Å from CA along +x direction (simplified)
+                # O is ~1.23 Å from C (simplified)
+                n_coord = ca_coord + np.array([-1.46, 0.0, 0.0])
+                c_coord = ca_coord + np.array([1.52, 0.0, 0.0])
+                o_coord = c_coord + np.array([0.0, 1.23, 0.0])
+                
+                # Write N atom
+                f.write(f"ATOM  {atom_num:5d}  N   {aa3} A{res_num:4d}    "
+                        f"{n_coord[0]:8.3f}{n_coord[1]:8.3f}{n_coord[2]:8.3f}"
+                        f"  1.00{plddt:6.2f}           N\n")
+                atom_num += 1
+                
+                # Write CA atom
+                f.write(f"ATOM  {atom_num:5d}  CA  {aa3} A{res_num:4d}    "
+                        f"{ca_coord[0]:8.3f}{ca_coord[1]:8.3f}{ca_coord[2]:8.3f}"
+                        f"  1.00{plddt:6.2f}           C\n")
+                atom_num += 1
+                
+                # Write C atom
+                f.write(f"ATOM  {atom_num:5d}  C   {aa3} A{res_num:4d}    "
+                        f"{c_coord[0]:8.3f}{c_coord[1]:8.3f}{c_coord[2]:8.3f}"
+                        f"  1.00{plddt:6.2f}           C\n")
+                atom_num += 1
+                
+                # Write O atom
+                f.write(f"ATOM  {atom_num:5d}  O   {aa3} A{res_num:4d}    "
+                        f"{o_coord[0]:8.3f}{o_coord[1]:8.3f}{o_coord[2]:8.3f}"
+                        f"  1.00{plddt:6.2f}           O\n")
+                atom_num += 1
+            
+            f.write("END\n")
+    
     def compute_sequence_similarity(self, seq1: str, seq2: str) -> float:
         """Compute sequence identity between two sequences."""
         if len(seq1) != len(seq2):
@@ -266,26 +357,68 @@ class HallucinationMCTS:
         reward = 0.4 * parent_child_similarity + 0.3 * sibling_convergence + 0.3 * normalized_plddt
         return reward
     
-    def expand_node(self, node: HallucinationNode) -> List[HallucinationNode]:
+    def expand_node(self, node: HallucinationNode, iteration: int = 0) -> List[HallucinationNode]:
         """
         Expand a node by running Structure → ProteinMPNN cycle.
         
         Like Protein Hunter / HalluDesign:
         1. Fold current sequence to get structure
-        2. Sample K sequences from ProteinMPNN
-        3. Optionally fold each candidate to evaluate
-        4. Select best candidates based on reward
+        2. Run DSSP for SS analysis (if SS guidance enabled)
+        3. Sample K sequences from ProteinMPNN
+        4. Apply SS-guided modifications (variant-specific)
+        5. Optionally fold each candidate to evaluate
+        6. Select best candidates based on reward
         
         Returns list of child nodes.
         """
+        edit_log = []  # Track all edits for logging
+        dssp_result = None
+        
         # Step 1: Predict structure from current sequence
         backend_name = self.structure_backend.upper()
         print(f"      🔮 {backend_name} predicting structure from: {node.sequence[:30]}...")
-        structure_result = self.structure_predictor.predict_structure(node.sequence)
+        
+        # Get template/ligand conditioning for Variants 3 & 4
+        template_cond = None
+        ligand_cond = None
+        if self.ss_guidance:
+            template_cond = self.ss_guidance.get_template_conditioning(iteration)
+            ligand_cond = self.ss_guidance.get_ligand_conditioning(iteration)
+        
+        # Call structure predictor (with optional conditioning)
+        if template_cond or ligand_cond:
+            # Check if backend supports conditioning
+            if hasattr(self.structure_predictor, 'predict_structure_with_conditioning'):
+                structure_result = self.structure_predictor.predict_structure_with_conditioning(
+                    node.sequence,
+                    template=template_cond,
+                    ligand=ligand_cond,
+                )
+            else:
+                print(f"      ⚠️ Backend {backend_name} does not support template/ligand conditioning")
+                structure_result = self.structure_predictor.predict_structure(node.sequence)
+        else:
+            structure_result = self.structure_predictor.predict_structure(node.sequence)
+        
         coords = structure_result['coordinates']
         parent_plddt = structure_result['confidence']
         parent_mean_plddt = float(np.mean(parent_plddt))
         print(f"      ✅ {backend_name} done - mean pLDDT={parent_mean_plddt:.1f}, min={np.min(parent_plddt):.1f}, max={np.max(parent_plddt):.1f}")
+        
+        # Step 1.5: Save PDB and run DSSP for SS analysis
+        if self.ss_guidance and self.run_dir:
+            # Save temporary PDB for DSSP
+            temp_pdb_path = self.run_dir / f"iter_{iteration:03d}" / "structure_pred.pdb"
+            temp_pdb_path.parent.mkdir(parents=True, exist_ok=True)
+            self._save_pdb_for_dssp(node.sequence, coords, parent_plddt, str(temp_pdb_path))
+            
+            # Run DSSP
+            dssp_result = self.ss_guidance.run_dssp(str(temp_pdb_path), len(node.sequence))
+            if dssp_result:
+                n_helix = len(dssp_result.helix_positions)
+                n_beta = len(dssp_result.beta_positions)
+                print(f"      🧬 DSSP: {n_helix} helix, {n_beta} beta, "
+                      f"{len(dssp_result.helix_segments)} helix segs, {len(dssp_result.beta_segments)} beta segs")
         
         # Log traj_mode for future AF3 truncated diffusion support
         if self.traj_mode != "default":
@@ -294,7 +427,7 @@ class HallucinationMCTS:
         # Step 2: Generate K candidate sequences from the structure
         # This is the key HalluDesign insight: sample multiple, pick best
         candidate_sequences = []
-        candidate_data = []  # Store (sequence, coords, plddt) for each candidate
+        candidate_data = []  # Store (sequence, coords, plddt, edit_log) for each candidate
         
         total_candidates = self.num_candidates * self.num_rollouts
         print(f"      🧬 Generating {total_candidates} candidate sequences (K={self.num_candidates} x {self.num_rollouts} rollouts)...")
@@ -305,10 +438,28 @@ class HallucinationMCTS:
                 for k in range(self.num_candidates):
                     # Inherit the full parent sequence without masking (ProteinHunter-style).
                     masked_seq = node.sequence
+                    
+                    # Variant 1: Apply beta-lock before MPNN (lock beta positions)
+                    if (self.ss_guidance and dssp_result and 
+                        self.ss_guidance_config.ss_guidance == "beta_lock_reinit_helix"):
+                        masked_seq, variant1_edits = self.ss_guidance.apply_variant1_beta_lock_reinit_helix(
+                            node.sequence, dssp_result
+                        )
+                        edit_log.extend(variant1_edits)
+                    
                     new_sequence = self.hallucination_expert.proteinmpnn.design_sequence(
                         coordinates=coords,
                         masked_sequence=masked_seq,
                     )
+                    
+                    # Variant 2: Apply PG injection after MPNN
+                    candidate_edit_log = []
+                    if (self.ss_guidance and dssp_result and 
+                        self.ss_guidance_config.ss_guidance == "x_init_helix_pg"):
+                        new_sequence, variant2_edits = self.ss_guidance.apply_variant2_helix_pg_injection(
+                            new_sequence, dssp_result
+                        )
+                        candidate_edit_log.extend(variant2_edits)
                     
                     # Evaluate the new sequence with structure predictor
                     new_structure_result = self.structure_predictor.predict_structure(new_sequence)
@@ -317,7 +468,7 @@ class HallucinationMCTS:
                     new_mean_plddt = float(np.mean(new_plddt))
                     
                     candidate_sequences.append(new_sequence)
-                    candidate_data.append((new_sequence, new_coords, new_plddt, new_mean_plddt))
+                    candidate_data.append((new_sequence, new_coords, new_plddt, new_mean_plddt, candidate_edit_log))
                     
                     print(f"      ✅ Candidate {len(candidate_sequences)}: pLDDT={new_mean_plddt:.1f}, seq={new_sequence[:20]}...")
                 
@@ -332,7 +483,7 @@ class HallucinationMCTS:
         
         # Step 4: Create child nodes with both convergence metrics
         children = []
-        for i, (seq, new_coords, new_plddt, new_mean_plddt) in enumerate(candidate_data):
+        for i, (seq, new_coords, new_plddt, new_mean_plddt, cand_edit_log) in enumerate(candidate_data):
             # Compute parent-child similarity (key convergence metric from papers)
             parent_child_sim = self.compute_sequence_similarity(node.sequence, seq)
             
@@ -382,6 +533,8 @@ class HallucinationMCTS:
         """
         print("\n" + "="*80)
         print("🚀 Starting Hallucination MCTS Search")
+        if self.ss_guidance_config.ss_guidance != "none":
+            print(f"   SS Guidance: {self.ss_guidance_config.ss_guidance}")
         print("="*80)
         
         # Create root node with initial sequence based on init_mode
@@ -398,6 +551,9 @@ class HallucinationMCTS:
         # Track node IDs for PDB saving
         node_counter = 0
         
+        # Track summary data for CSV
+        summary_rows = []
+        
         # Run MCTS iterations
         best_node = root
         best_convergence = 0.0
@@ -410,14 +566,21 @@ class HallucinationMCTS:
             print(f"   📍 Selected node at depth {selected.depth}")
             
             # Expansion (if not at max depth)
+            iter_best_plddt = 0.0
+            iter_best_reward = 0.0
+            iter_num_valid = 0
+            
             if selected.depth < self.max_depth:
-                children = self.expand_node(selected)
+                children = self.expand_node(selected, iteration=iteration)
                 selected.children.extend(children)
                 
                 # Backpropagate for each child and save PDB files
                 for child in children:
                     node_counter += 1
                     self.backpropagate(child, child.get_reward())
+                    iter_num_valid += 1
+                    iter_best_plddt = max(iter_best_plddt, child.mean_plddt)
+                    iter_best_reward = max(iter_best_reward, child.get_reward())
                     
                     # Save PDB file for this child
                     if child.coordinates is not None:
@@ -437,6 +600,16 @@ class HallucinationMCTS:
                         best_node = child
                         print(f"   🏆 New best: parent_sim={best_convergence:.3f}, pLDDT={child.mean_plddt:.1f}, depth={child.depth}")
             
+            # Record summary row
+            summary_rows.append({
+                "iteration": iteration + 1,
+                "mean_plddt": iter_best_plddt,
+                "best_reward": iter_best_reward,
+                "num_valid": iter_num_valid,
+                "best_convergence": best_convergence,
+                "best_depth": best_node.depth,
+            })
+            
             # Check for convergence (>95% similarity)
             if best_convergence > 0.95:
                 print(f"\n✅ Converged! Parent-child similarity > 95%")
@@ -455,7 +628,27 @@ class HallucinationMCTS:
             )
             print(f"\n💾 Best structure saved: {final_pdb}")
         
+        # Save summary CSV if SS guidance is enabled
+        if self.run_dir:
+            self._save_summary_csv(summary_rows)
+        
         return best_node
+    
+    def _save_summary_csv(self, summary_rows: List[Dict]):
+        """Save summary CSV with per-iteration metrics."""
+        import csv
+        csv_path = self.run_dir / "summary.csv"
+        
+        if not summary_rows:
+            return
+        
+        fieldnames = list(summary_rows[0].keys())
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        
+        print(f"   📊 Summary saved: {csv_path}")
     
     def find_best_in_tree(self, root: HallucinationNode) -> HallucinationNode:
         """Find the best node in the entire tree by convergence."""
@@ -488,6 +681,8 @@ def test_hallucination_mcts(
     structure_backend: str = "esmfold",
     num_candidates: int = 2,
     traj_mode: str = "default",
+    ss_guidance_config: Optional[SSGuidanceConfig] = None,
+    seed: Optional[int] = None,
 ):
     """
     Test the hallucination MCTS design.
@@ -502,12 +697,16 @@ def test_hallucination_mcts(
         structure_backend: "esmfold" or "boltz" for structure prediction
         num_candidates: K candidates per cycle (HalluDesign style)
         traj_mode: "short", "long", "default" - for future AF3 truncated diffusion
+        ss_guidance_config: Optional SS guidance configuration
+        seed: Random seed for reproducibility
     """
     print("\n" + "="*80)
     print(f"Test: Hallucination MCTS Design")
     print(f"  Length: {length}, Mock: {use_mock}, Init: {init_mode}")
     print(f"  Iterations: {num_iterations}, Max Depth: {max_depth}")
     print(f"  Backend: {structure_backend}, K={num_candidates}, Traj: {traj_mode}")
+    if ss_guidance_config and ss_guidance_config.ss_guidance != "none":
+        print(f"  SS Guidance: {ss_guidance_config.ss_guidance}")
     print("="*80 + "\n")
     
     # Create MCTS
@@ -522,6 +721,8 @@ def test_hallucination_mcts(
         structure_backend=structure_backend,
         num_candidates=num_candidates,
         traj_mode=traj_mode,
+        ss_guidance_config=ss_guidance_config,
+        seed=seed,
     )
     
     # Run search
@@ -810,18 +1011,75 @@ if __name__ == "__main__":
                         help="K candidates per cycle (HalluDesign style multi-candidate selection)")
     parser.add_argument("--traj-mode", choices=["short", "long", "default"], default="default",
                         help="Trajectory mode for future AF3 truncated diffusion support")
+    
+    # SS Guidance arguments
+    parser.add_argument("--ss-guidance", 
+                        choices=["none", "beta_lock_reinit_helix", "x_init_helix_pg", 
+                                 "x_init_beta_template", "x_init_ligand_first"],
+                        default="none",
+                        help="Secondary structure guidance mode")
+    parser.add_argument("--pg-inject-prob", type=float, default=0.1,
+                        help="Probability of P/G injection in helix regions (Variant 2)")
+    parser.add_argument("--pg-inject-targets", type=str, default="PG",
+                        help="Target residues for injection: P, G, or PG (Variant 2)")
+    parser.add_argument("--helix-reinit", choices=["mask_x", "random"], default="mask_x",
+                        help="How to reinitialize helix positions (Variant 1)")
+    parser.add_argument("--beta-min-len", type=int, default=3,
+                        help="Minimum beta segment length for DSSP")
+    parser.add_argument("--helix-min-len", type=int, default=4,
+                        help="Minimum helix segment length for DSSP")
+    parser.add_argument("--beta-template-path", type=str, default=None,
+                        help="Path to beta template PDB/CIF (Variant 3)")
+    parser.add_argument("--template-persist", action="store_true",
+                        help="Keep template conditioning after iteration 1 (Variant 3)")
+    parser.add_argument("--ligand-path", type=str, default=None,
+                        help="Path to ligand file (SDF/MOL2/PDB) for ATP (Variant 4)")
+    parser.add_argument("--first-iter-only", action="store_true", default=True,
+                        help="Apply template/ligand only in first iteration (Variants 3-4)")
+    parser.add_argument("--ss-require-dssp", action="store_true",
+                        help="Hard-fail if DSSP is unavailable")
+    parser.add_argument("--results-dir", type=str, 
+                        default="./ss_guidance_results",
+                        help="Root directory for SS guidance results")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility")
+    parser.add_argument("--max-iters", type=int, default=None,
+                        help="Alias for --iterations (for fair comparison)")
+    
     args = parser.parse_args()
+    
+    # Handle max-iters alias
+    if args.max_iters is not None:
+        args.iterations = args.max_iters
     
     print("\n" + "="*80)
     print("Hallucination Design Tests")
     print("="*80)
     
     if args.test in ["mcts", "all"]:
+        # Create SS guidance config from args
+        ss_config = SSGuidanceConfig(
+            ss_guidance=args.ss_guidance,
+            ss_require_dssp=args.ss_require_dssp,
+            beta_min_len=args.beta_min_len,
+            helix_min_len=args.helix_min_len,
+            pg_inject_prob=args.pg_inject_prob,
+            pg_inject_targets=args.pg_inject_targets,
+            helix_reinit=args.helix_reinit,
+            beta_template_path=args.beta_template_path,
+            template_persist=args.template_persist,
+            ligand_path=args.ligand_path,
+            first_iter_only=args.first_iter_only,
+            results_dir=args.results_dir,
+        )
+        
         # Test hallucination MCTS
         print(f"\n🧪 Running Hallucination MCTS")
         print(f"   Length: {args.length}, Real: {args.real}, Init: {args.init_mode}")
         print(f"   Iterations: {args.iterations}, Max Depth: {args.max_depth}")
         print(f"   Backend: {args.backend}, K={args.num_candidates}, Traj: {args.traj_mode}")
+        if args.ss_guidance != "none":
+            print(f"   SS Guidance: {args.ss_guidance}")
         
         best_node, mcts, path = test_hallucination_mcts(
             use_mock=not args.real, 
@@ -833,12 +1091,16 @@ if __name__ == "__main__":
             structure_backend=args.backend,
             num_candidates=args.num_candidates,
             traj_mode=args.traj_mode,
+            ss_guidance_config=ss_config,
+            seed=args.seed,
         )
         
         # Save results to JSON
         save_results_to_json(mcts, path)
         print(f"\n✅ MCTS test completed!")
         print(f"   PDB files saved to: {mcts.output_dir}")
+        if mcts.run_dir:
+            print(f"   SS guidance artifacts: {mcts.run_dir}")
     
     if args.test in ["expert", "all"]:
         # Test standalone expert
