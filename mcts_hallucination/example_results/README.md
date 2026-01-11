@@ -1,5 +1,28 @@
 # Hallucination MCTS Example Results
 
+This directory contains example results from two main pipelines:
+
+## 1. DNA Aptamer Results (NEW)
+
+### Task A: Known Aptamer Docking (`aptamer_6922_docking/`)
+**All-atom tertiary structure prediction and predicted docking of a known 80-nucleotide DNA aptamer to small proteins of known structure.**
+
+- **Status**: ✅ WORKING
+- **Best Result**: Aptamer 6922 + TIRR complex with pLDDT = 65.22
+- See `aptamer_6922_docking/RESULTS_INTERPRETATION.md` for details
+
+### Task B: De Novo Aptamer Design (`aptamer_denovo_design/`)
+**De novo predicted DNA aptamer sequences and all-atom tertiary structures and docked all-atom models for cell-surface target proteins.**
+
+- **Status**: ✅ WORKING (CD137 complete, others in progress)
+- **Best Result**: Novel 60-nt aptamer for CD137 with pLDDT = 84.5
+- **Designed Sequence**: `CTCTGCCAGTGTAGTTCCAGTTCTCTAATATGAACCATTACCCAACACCTTGTAGGTACT`
+- See `aptamer_denovo_design/RESULTS_INTERPRETATION.md` for details
+
+---
+
+## 2. Protein Hallucination Results (Original)
+
 Comparison of different initialization modes and backends for 100aa protein hallucination.
 
 ## Results Summary

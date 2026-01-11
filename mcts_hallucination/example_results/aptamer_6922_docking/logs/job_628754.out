@@ -1,0 +1,207 @@
+============================================================================
+ABCFold DNA Aptamer Pipeline
+============================================================================
+Job ID: 628754
+Host: j003-ds
+Start: Sun Jan 11 10:28:56 AM CST 2026
+Results: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856
+============================================================================
+name, memory.total [MiB]
+NVIDIA A100 80GB PCIe, 81920 MiB
+Python: /net/scratch/caom/hallucination_env/bin/python
+Python 3.12.3
+Boltz: /net/scratch/caom/hallucination_env/bin/boltz
+
+Writing aptamer FASTA files...
+  Created: aptamer_6922.fasta (80 nt)
+  Created: aptamer_6927.fasta (80 nt)
+
+Downloading protein structures...
+  Downloading 6D0L (TIRR)...
+    Downloaded: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/inputs/6D0L.pdb
+  Downloading 6CO2 (Nudt16TI)...
+    Downloaded: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/inputs/6CO2.pdb
+  Downloading 3COU (Nudt16)...
+    Downloaded: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/inputs/3COU.pdb
+
+============================================================================
+Task 1: Aptamer-only tertiary structure prediction
+============================================================================
+
+--- aptamer_6922_only ---
+  FASTA: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/aptamer_only/6922/input.fasta
+  Output: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/aptamer_only/6922
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+Checking input data.
+Running predictions for 1 structure
+Processing input data.
+  0%|          | 0/1 [00:00<?, ?it/s]100%|██████████| 1/1 [00:00<00:00,  4.54it/s]100%|██████████| 1/1 [00:00<00:00,  4.53it/s]
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/lightning_fabric/plugins/environments/slurm.py:204: The `srun` command is available on your system but is not used. HINT: If your intention is to run Lightning on SLURM, prepend your python command with `srun` like so: srun python3.12 /net/scratch/caom/hallucination_env/bin/boltz pr ...
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/logger_connector/logger_connector.py:75: Starting from v1.9.0, `tensorboardX` has been removed as a dependency of the `pytorch_lightning` package, due to potential conflicts with other packages in the ML ecosystem. For this reason, `logger=True` will use `CSVLogger` as the default logger, unless the `tensorboard` or `tensorboardX` packages are found. Please `pip install lightning[extra]` or one of them to enable TensorBoard support by default
+You are using a CUDA device ('NVIDIA A100 80GB PCIe') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0: 100%|██████████| 1/1 [00:07<00:00,  0.13it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 1/1 [00:07<00:00,  0.13it/s]
+  Saved: best_model.cif
+  Mean pLDDT: 40.58
+  Runtime: 49s
+
+--- aptamer_6927_only ---
+  FASTA: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/aptamer_only/6927/input.fasta
+  Output: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/aptamer_only/6927
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+Checking input data.
+Running predictions for 1 structure
+Processing input data.
+  0%|          | 0/1 [00:00<?, ?it/s]100%|██████████| 1/1 [00:00<00:00,  4.61it/s]100%|██████████| 1/1 [00:00<00:00,  4.61it/s]
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/lightning_fabric/plugins/environments/slurm.py:204: The `srun` command is available on your system but is not used. HINT: If your intention is to run Lightning on SLURM, prepend your python command with `srun` like so: srun python3.12 /net/scratch/caom/hallucination_env/bin/boltz pr ...
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/logger_connector/logger_connector.py:75: Starting from v1.9.0, `tensorboardX` has been removed as a dependency of the `pytorch_lightning` package, due to potential conflicts with other packages in the ML ecosystem. For this reason, `logger=True` will use `CSVLogger` as the default logger, unless the `tensorboard` or `tensorboardX` packages are found. Please `pip install lightning[extra]` or one of them to enable TensorBoard support by default
+You are using a CUDA device ('NVIDIA A100 80GB PCIe') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0: 100%|██████████| 1/1 [00:07<00:00,  0.13it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 1/1 [00:07<00:00,  0.13it/s]
+  Saved: best_model.cif
+  Mean pLDDT: 48.05
+  Runtime: 49s
+
+============================================================================
+Task 2-4: Complex prediction (aptamer 6922 + proteins)
+============================================================================
+
+--- Complex: aptamer_6922 + 6D0L (TIRR) ---
+  Protein sequence length: 201
+
+--- aptamer_6922_6D0L ---
+  FASTA: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_6D0L/input.fasta
+  Output: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_6D0L
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+Checking input data.
+Running predictions for 1 structure
+Processing input data.
+  0%|          | 0/1 [00:00<?, ?it/s]Generating MSA for /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_6D0L/input.fasta with 1 protein entities.
+
+  0%|          | 0/150 [elapsed: 00:00 remaining: ?][A
+SUBMIT:   0%|          | 0/150 [elapsed: 00:00 remaining: ?][A
+PENDING:   0%|          | 0/150 [elapsed: 00:00 remaining: ?][ASleeping for 10s. Reason: PENDING
+
+RUNNING:   0%|          | 0/150 [elapsed: 00:11 remaining: ?][A
+RUNNING:   7%|▋         | 10/150 [elapsed: 00:11 remaining: 02:37][ASleeping for 8s. Reason: RUNNING
+
+COMPLETE:   7%|▋         | 10/150 [elapsed: 00:19 remaining: 02:37][A
+COMPLETE: 100%|██████████| 150/150 [elapsed: 00:19 remaining: 00:00][ACOMPLETE: 100%|██████████| 150/150 [elapsed: 00:21 remaining: 00:00]
+100%|██████████| 1/1 [00:21<00:00, 21.42s/it]100%|██████████| 1/1 [00:21<00:00, 21.43s/it]
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/lightning_fabric/plugins/environments/slurm.py:204: The `srun` command is available on your system but is not used. HINT: If your intention is to run Lightning on SLURM, prepend your python command with `srun` like so: srun python3.12 /net/scratch/caom/hallucination_env/bin/boltz pr ...
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/logger_connector/logger_connector.py:75: Starting from v1.9.0, `tensorboardX` has been removed as a dependency of the `pytorch_lightning` package, due to potential conflicts with other packages in the ML ecosystem. For this reason, `logger=True` will use `CSVLogger` as the default logger, unless the `tensorboard` or `tensorboardX` packages are found. Please `pip install lightning[extra]` or one of them to enable TensorBoard support by default
+You are using a CUDA device ('NVIDIA A100 80GB PCIe') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0: 100%|██████████| 1/1 [00:13<00:00,  0.08it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 1/1 [00:13<00:00,  0.08it/s]
+  Saved: best_model.cif
+  Mean pLDDT: 65.22
+  Runtime: 79s
+
+--- Complex: aptamer_6922 + 6CO2 (Nudt16TI) ---
+  Protein sequence length: 180
+
+--- aptamer_6922_6CO2 ---
+  FASTA: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_6CO2/input.fasta
+  Output: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_6CO2
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+Checking input data.
+Running predictions for 1 structure
+Processing input data.
+  0%|          | 0/1 [00:00<?, ?it/s]Generating MSA for /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_6CO2/input.fasta with 1 protein entities.
+
+  0%|          | 0/150 [elapsed: 00:00 remaining: ?][A
+SUBMIT:   0%|          | 0/150 [elapsed: 00:00 remaining: ?][A
+PENDING:   0%|          | 0/150 [elapsed: 00:00 remaining: ?][ASleeping for 8s. Reason: PENDING
+
+RUNNING:   0%|          | 0/150 [elapsed: 00:09 remaining: ?][A
+RUNNING:   5%|▌         | 8/150 [elapsed: 00:09 remaining: 02:43][ASleeping for 7s. Reason: RUNNING
+
+RUNNING:   5%|▌         | 8/150 [elapsed: 00:16 remaining: 02:43][A
+RUNNING:  10%|█         | 15/150 [elapsed: 00:16 remaining: 02:30][ASleeping for 8s. Reason: RUNNING
+
+COMPLETE:  10%|█         | 15/150 [elapsed: 00:25 remaining: 02:30][A
+COMPLETE: 100%|██████████| 150/150 [elapsed: 00:25 remaining: 00:00][ACOMPLETE: 100%|██████████| 150/150 [elapsed: 00:27 remaining: 00:00]
+100%|██████████| 1/1 [00:27<00:00, 27.69s/it]100%|██████████| 1/1 [00:27<00:00, 27.69s/it]
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/lightning_fabric/plugins/environments/slurm.py:204: The `srun` command is available on your system but is not used. HINT: If your intention is to run Lightning on SLURM, prepend your python command with `srun` like so: srun python3.12 /net/scratch/caom/hallucination_env/bin/boltz pr ...
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/logger_connector/logger_connector.py:75: Starting from v1.9.0, `tensorboardX` has been removed as a dependency of the `pytorch_lightning` package, due to potential conflicts with other packages in the ML ecosystem. For this reason, `logger=True` will use `CSVLogger` as the default logger, unless the `tensorboard` or `tensorboardX` packages are found. Please `pip install lightning[extra]` or one of them to enable TensorBoard support by default
+You are using a CUDA device ('NVIDIA A100 80GB PCIe') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0: 100%|██████████| 1/1 [00:13<00:00,  0.08it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 1/1 [00:13<00:00,  0.08it/s]
+  Saved: best_model.cif
+  Mean pLDDT: 64.20
+  Runtime: 90s
+
+--- Complex: aptamer_6922 + 3COU (Nudt16) ---
+  Protein sequence length: 180
+
+--- aptamer_6922_3COU ---
+  FASTA: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_3COU/input.fasta
+  Output: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_3COU
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+Checking input data.
+Running predictions for 1 structure
+Processing input data.
+  0%|          | 0/1 [00:00<?, ?it/s]Generating MSA for /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856/complex/6922_3COU/input.fasta with 1 protein entities.
+
+  0%|          | 0/150 [elapsed: 00:00 remaining: ?][A
+SUBMIT:   0%|          | 0/150 [elapsed: 00:00 remaining: ?][ATimeout while submitting to MSA server. Retrying...
+
+RUNNING:   0%|          | 0/150 [elapsed: 00:12 remaining: ?][ASleeping for 10s. Reason: RUNNING
+
+COMPLETE:   0%|          | 0/150 [elapsed: 00:29 remaining: ?][A
+COMPLETE: 100%|██████████| 150/150 [elapsed: 00:29 remaining: 00:00][AError while fetching result from MSA server. Retrying... (1/5)
+Error: HTTPSConnectionPool(host='api.colabfold.com', port=443): Read timed out.
+Error while fetching result from MSA server. Retrying... (2/5)
+Error: HTTPSConnectionPool(host='api.colabfold.com', port=443): Read timed out.
+Error while fetching result from MSA server. Retrying... (3/5)
+Error: HTTPSConnectionPool(host='api.colabfold.com', port=443): Read timed out.
+COMPLETE: 100%|██████████| 150/150 [elapsed: 02:30 remaining: 00:00]
+100%|██████████| 1/1 [02:30<00:00, 150.64s/it]100%|██████████| 1/1 [02:30<00:00, 150.64s/it]
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/lightning_fabric/plugins/environments/slurm.py:204: The `srun` command is available on your system but is not used. HINT: If your intention is to run Lightning on SLURM, prepend your python command with `srun` like so: srun python3.12 /net/scratch/caom/hallucination_env/bin/boltz pr ...
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+/net/scratch/caom/hallucination_env/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/logger_connector/logger_connector.py:75: Starting from v1.9.0, `tensorboardX` has been removed as a dependency of the `pytorch_lightning` package, due to potential conflicts with other packages in the ML ecosystem. For this reason, `logger=True` will use `CSVLogger` as the default logger, unless the `tensorboard` or `tensorboardX` packages are found. Please `pip install lightning[extra]` or one of them to enable TensorBoard support by default
+You are using a CUDA device ('NVIDIA A100 80GB PCIe') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/1 [00:00<?, ?it/s]Predicting DataLoader 0: 100%|██████████| 1/1 [00:13<00:00,  0.08it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 1/1 [00:13<00:00,  0.08it/s]
+  Saved: best_model.cif
+  Mean pLDDT: 62.01
+  Runtime: 214s
+
+============================================================================
+Pipeline Complete
+============================================================================
+Results directory: /home/caom/AID3/dplm/mcts_diffusion_finetune/mcts_hallucination/results/abcfold_aptamer_6922_vs_6927/20260111_102856
+
+Metrics summary:
+task_name,target,top_model_confidence,runtime_seconds,notes
+aptamer_6922_only,none,40.58,49,success
+aptamer_6927_only,none,48.05,49,success
+aptamer_6922_6D0L,6D0L,65.22,79,success
+aptamer_6922_6CO2,6CO2,64.20,90,success
+aptamer_6922_3COU,3COU,62.01,214,success
+
+End: Sun Jan 11 10:36:59 AM CST 2026
