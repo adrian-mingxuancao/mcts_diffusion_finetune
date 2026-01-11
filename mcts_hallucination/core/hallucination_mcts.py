@@ -163,7 +163,7 @@ class HallucinationMCTS:
         traj_mode: str = "default",
         ss_guidance_config: Optional[SSGuidanceConfig] = None,
         seed: Optional[int] = None,
-        use_ph_uct: bool = True,
+        use_ph_uct: bool = False,  # Default to standard UCT (no entropy/novelty)
         entropy_weight: float = 0.1,
         novelty_weight: float = 0.05,
     ):
