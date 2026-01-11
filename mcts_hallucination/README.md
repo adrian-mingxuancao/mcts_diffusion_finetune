@@ -36,6 +36,47 @@ MCTS Tree Search:
 | **Masking Strategy** | pLDDT-based progressive | Confidence-based progressive |
 | **Expert Models** | DPLM-2 (650M, 150M, 3B) | AF3 + ProteinMPNN |
 
+## Quick Start
+
+### Automated Setup
+
+Run the setup script to install all dependencies:
+
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+This will:
+1. Create a virtual environment at `/net/scratch/$USER/hallucination_env`
+2. Install Python dependencies from `requirements.txt`
+3. Install ABCFold (if present)
+4. Install DSSP for secondary structure analysis
+5. Verify all imports work correctly
+
+### Manual Setup
+
+```bash
+# 1. Create and activate virtual environment
+python3 -m venv /net/scratch/$USER/hallucination_env
+source /net/scratch/$USER/hallucination_env/bin/activate
+
+# 2. Install Python dependencies
+pip install -r requirements.txt
+
+# 3. Install DSSP (required for SS guidance)
+# Download micromamba if not available
+curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | \
+    tar -xvj -C /net/scratch/$USER/bin --strip-components=1 bin/micromamba
+
+# Create DSSP environment
+/net/scratch/$USER/bin/micromamba create -y \
+    -p /net/scratch/$USER/dssp_env \
+    -c conda-forge dssp
+
+# Verify DSSP installation
+/net/scratch/$USER/dssp_env/bin/mkdssp --version
+```
 
 ## Installation
 
@@ -309,3 +350,71 @@ MCTS Iteration:
 ```
 
 The key difference: Instead of starting from a baseline and refining it (DPLM approach), hallucination starts from masked positions and generates novel structures de novo.
+
+## Core Modules
+
+The `core/` directory contains all the integration modules:
+
+| Module | Description |
+|--------|-------------|
+| `hallucination_expert.py` | Main expert class combining structure prediction + inverse folding |
+| `hallucination_mcts.py` | MCTS implementation with PH-UCT, entropy bonuses, and multi-expert rollouts |
+| `esmfold_integration.py` | ESMFold structure prediction (HuggingFace transformers) |
+| `abcfold_integration.py` | ABCFold wrapper for AF3/Boltz/Chai backends |
+| `proteinmpnn_integration.py` | ProteinMPNN inverse folding |
+| `nampnn_integration.py` | NA-MPNN for nucleic acid design |
+| `boltzdesign_integration.py` | BoltzDesign1 binder design |
+| `pocketgen_integration.py` | PocketGen pocket generation |
+| `rnaframeflow_integration.py` | RNA-FrameFlow backbone design |
+| `ss_guidance.py` | Secondary structure guidance with DSSP analysis |
+| `complex_input.py` | Complex input handling for multi-chain systems |
+| `complex_state.py` | State management for complex designs |
+
+## Environment Variables
+
+```bash
+# Required
+export PROTEINMPNN_PATH=/path/to/proteinmpnn
+
+# Optional (for different backends)
+export BOLTZ_CKPT=~/.boltz/boltz1_conf.ckpt
+export BOLTZ_CCD=~/.boltz/ccd.pkl
+
+# DSSP (set automatically by setup.sh)
+# Binary at: /net/scratch/$USER/dssp_env/bin/mkdssp
+```
+
+## Testing
+
+```bash
+# Quick test with mock models (no GPU required)
+python test_backends.py --mock
+
+# Test with real ESMFold (requires GPU)
+python test_backends.py
+
+# Test hallucination MCTS integration
+python test_integration.py --use-mock
+
+# Test with SS guidance
+python test_integration.py --ss-guidance beta_lock_reinit_helix
+```
+
+## SLURM/Sbatch Usage
+
+Example sbatch script for running on a cluster:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=hallucination
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --time=4:00:00
+#SBATCH --mem=32G
+
+source /net/scratch/$USER/hallucination_env/bin/activate
+export PROTEINMPNN_PATH=/path/to/proteinmpnn
+
+cd /path/to/mcts_hallucination
+python test_integration.py --structure-backend boltz --num-iterations 10
+```
