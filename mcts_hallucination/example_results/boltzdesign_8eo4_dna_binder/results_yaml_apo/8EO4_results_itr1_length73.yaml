@@ -1,0 +1,7 @@
+sequences:
+- protein:
+    id:
+    - A
+    msa: empty
+    sequence: AIDPPDIVIYWYYWFYWRWWYRWNWYVDYIPDNGGDPDHFHRVLSRFFWRFWYRYYYYYYYYYYIYYVGGGPG
+version: 1

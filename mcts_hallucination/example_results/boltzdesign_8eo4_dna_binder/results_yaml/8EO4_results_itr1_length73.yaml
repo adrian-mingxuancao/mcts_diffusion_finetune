@@ -1,0 +1,15 @@
+sequences:
+- protein:
+    id:
+    - A
+    msa: empty
+    sequence: AIDPPDIVIYWYYWFYWRWWYRWNWYVDYIPDNGGDPDHFHRVLSRFFWRFWYRYYYYYYYYYYIYYVGGGPG
+- dna:
+    id:
+    - B
+    sequence: AATAAGGGAAGTGGG
+- dna:
+    id:
+    - C
+    sequence: TCCCACTTCGCTTAT
+version: 1
