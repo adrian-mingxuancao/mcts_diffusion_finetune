@@ -1,90 +1,118 @@
 """
-MCTS Framework with External Expert Support (Including Hallucination)
+Hallucination MCTS - Standalone MCTS for Protein Hallucination Design
 
-⚠️ IMPORTANT: This is a COPY of sequence_level_mcts.py with external expert handling added.
+This module implements MCTS-guided protein hallucination using:
+- Structure prediction: ESMFold, Boltz, or Chai-1 (via ABCFold)
+- Inverse folding: ProteinMPNN or NA-MPNN
+- SS guidance: DSSP-based secondary structure analysis
 
-FOR ACTUAL USE:
-- Use the original: mcts_diffusion_finetune/core/sequence_level_mcts.py
-- This file is kept here as REFERENCE showing what was added for external experts
+Pipeline per iteration:
+1. Sequence -> Structure (ESMFold/Boltz/Chai)
+2. Structure -> New Sequence (ProteinMPNN)
+3. Evaluate convergence (parent-child similarity, sibling convergence, pLDDT)
+4. UCT selection and backpropagation
 
-The key addition is in _expand_with_multi_expert_rollouts (lines 540-617):
-- Loops through self.external_experts
-- Calls expert.generate_candidate() for each rollout
-- Evaluates and adds candidates to the pool
-
-To use hallucination expert:
-    from mcts_hallucination.core.hallucination_expert import create_hallucination_expert
-    from mcts_diffusion_finetune.core.sequence_level_mcts import GeneralMCTS
-    
-    expert = create_hallucination_expert()
-    mcts = GeneralMCTS(dplm2_integration=dplm2, external_experts=[expert], ...)
+This is a STANDALONE module that does NOT depend on dplm2_integration.
+All structure prediction and inverse folding use local core modules.
 """
 
 import math
+import random
+import csv
+import json
 from typing import List, Dict, Set, Tuple, Optional, Union
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 import sys
 import os
 import numpy as np
-import time
 
-# Add the project root to the path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add the mcts_hallucination directory to path
+HALLUCINATION_DIR = Path(__file__).resolve().parent.parent
+if str(HALLUCINATION_DIR) not in sys.path:
+    sys.path.insert(0, str(HALLUCINATION_DIR))
 
-# These imports are from the original mcts_diffusion_finetune package
-# They won't work in this isolated copy - use the original file instead
-try:
-    from core.dplm2_integration import DPLM2Integration
-    from utils.structure_converter import get_structure_converter
-    from utils.folding_metrics import (
-        evaluate_folding_metrics,
-        calculate_folding_reward,
-    )
-except ImportError:
-    # If imports fail, this file is being used standalone (not recommended)
-    print("⚠️ Warning: This is a reference copy. Use mcts_diffusion_finetune/core/sequence_level_mcts.py instead.")
-    DPLM2Integration = None
-    get_structure_converter = None
-    evaluate_folding_metrics = None
-    calculate_folding_reward = None
+# Import local core modules
+from core.hallucination_expert import create_hallucination_expert, HallucinationExpert
+from core.esmfold_integration import ESMFoldIntegration
+from core.abcfold_integration import ABCFoldIntegration
+from core.ss_guidance import (
+    SSGuidanceConfig,
+    SSGuidance,
+    DSSPResult,
+    EditLogEntry,
+    create_run_directory,
+)
 
 
 @dataclass
-class MCTSNode:
-    """MCTS node with complete sequences and mutable position tracking."""
-    sequence: str                           # COMPLETE sequence (no X's)
-    mutable_positions: Set[int]            # Positions that can be changed (low pLDDT)
-    frozen_positions: Set[int] = None      # Positions that are frozen (high pLDDT)
-    reward: float = 0.0
+class HallucinationNode:
+    """Node for hallucination MCTS - stores sequence-structure pair.
+    
+    Aligned with MCTSNode from sequence_level_mcts.py for compatibility.
+    """
+    sequence: str
+    coordinates: Optional[np.ndarray] = None
+    plddt_scores: Optional[np.ndarray] = None
+    mean_plddt: float = 0.0
+    
+    # Position tracking (aligned with sequence_level_mcts.py)
+    mutable_positions: Set[int] = field(default_factory=set)
+    frozen_positions: Set[int] = None
+    
+    # MCTS fields
+    parent: Optional['HallucinationNode'] = None
+    children: List['HallucinationNode'] = field(default_factory=list)
     visits: int = 0
     total_reward: float = 0.0
-    children: List['MCTSNode'] = None
-    parent: 'MCTSNode' = None
+    reward: float = 0.0  # Single reward value (aligned with sequence_level_mcts.py)
     depth: int = 0
-    plddt_scores: List[float] = None
+    
+    # Structure tokens (aligned with sequence_level_mcts.py)
     structure_tokens: Optional[str] = None
-    coordinates: Optional[np.ndarray] = None
     rmsd: Optional[float] = None
     tm_score: Optional[float] = None
+    
+    # Convergence tracking (hallucination-specific)
+    convergence_score: float = 0.0
+    parent_child_similarity: float = 0.0
+    sibling_convergence: float = 0.0
+    
     # PH-UCT components
     entropy: float = 0.0
     novelty: float = 0.0
     expert_source: str = None
     
     def __post_init__(self):
-        if self.children is None:
-            self.children = []
-        # Auto-compute frozen positions if not provided
-        if self.frozen_positions is None:
+        """Auto-compute frozen positions if not provided."""
+        if self.frozen_positions is None and self.mutable_positions:
             all_positions = set(range(len(self.sequence)))
             self.frozen_positions = all_positions - self.mutable_positions
     
     @property
     def masked_positions(self) -> Set[int]:
-        """Backward compatibility - return mutable positions"""
+        """Backward compatibility - return mutable positions."""
         return self.mutable_positions
     
-    def ph_uct_score(self, exploration_constant: float = 1.414, 
+    def get_reward(self) -> float:
+        """Average reward from visits."""
+        return self.total_reward / max(1, self.visits)
+    
+    def uct_score(self, exploration_constant: float = 1.414) -> float:
+        """Standard UCT score (aligned with sequence_level_mcts.py)."""
+        if self.visits == 0:
+            return float('inf')
+        
+        # Base UCB1 score
+        if self.parent and self.parent.visits > 0:
+            exploitation = self.total_reward / self.visits
+            exploration = exploration_constant * math.sqrt(math.log(self.parent.visits) / self.visits)
+            return exploitation + exploration
+        else:
+            return self.total_reward / self.visits
+    
+    def ph_uct_score(self, exploration_constant: float = 1.414,
                      entropy_weight: float = 0.1, novelty_weight: float = 0.05) -> float:
         """PH-UCT score with entropy and novelty bonuses."""
         if self.visits == 0:
@@ -103,1252 +131,201 @@ class MCTSNode:
         novelty_bonus = novelty_weight * self.novelty
         
         return ucb_score + entropy_bonus + novelty_bonus
+
+
+class HallucinationMCTS:
+    """
+    MCTS for hallucination design using ESMFold/Boltz/Chai + ProteinMPNN.
     
-    def uct_score(self, exploration_constant: float = 1.414) -> float:
-        """Standard UCT score without entropy/novelty bonuses."""
-        if self.visits == 0:
-            return float('inf')
-        
-        # Standard UCB1 score only
-        if self.parent and self.parent.visits > 0:
-            exploitation = self.total_reward / self.visits
-            exploration = exploration_constant * math.sqrt(math.log(self.parent.visits) / self.visits)
-            return exploitation + exploration
-        else:
-            return self.total_reward / self.visits
-
-
-class GeneralMCTS:
-    """Proper MCTS with Diffusion and Multiple Expert Rollouts."""
+    Pipeline per node expansion:
+    1. Take current sequence
+    2. Structure predictor: sequence -> structure (coordinates + pLDDT)
+    3. ProteinMPNN: structure -> new sequence
+    4. Q-value = convergence (similarity to parent sequence)
+    
+    Goal: Find a converged sequence-structure pair.
+    """
+    
     def __init__(
         self,
-        dplm2_integration: object = None,
-        baseline_structure: dict = None,
-        reference_sequence: str = None,
-        reference_coords: Optional[np.ndarray] = None,
-        max_depth: int = 5,
+        sequence_length: int = 50,
+        max_depth: int = 10,
+        num_iterations: int = 20,
+        num_rollouts: int = 2,
         exploration_constant: float = 1.414,
-        ablation_mode: str = "multi_expert",
-        single_expert_id: int = None,
-        external_experts: list = None,
-        num_rollouts_per_expert: int = 2,
-        top_k_candidates: int = 2,
-        use_ph_uct: bool = True,  # NEW: Control PH-UCT vs standard UCT
-        # Backward compatibility
-        task_type: str = "inverse_folding",
-        num_simulations: int = 25,
-        temperature: float = 1.0,
-        use_plddt_masking: bool = True,
-        exclude_proteinmpnn: bool = False,  # Exclude ProteinMPNN for folding tasks
-        **kwargs
+        use_mock: bool = False,
+        device: str = "cuda",
+        init_mode: str = "random",
+        output_dir: Optional[str] = None,
+        structure_backend: str = "esmfold",
+        abcfold_engine: str = "boltz",
+        num_candidates: int = 2,
+        traj_mode: str = "default",
+        ss_guidance_config: Optional[SSGuidanceConfig] = None,
+        seed: Optional[int] = None,
+        use_ph_uct: bool = True,
+        entropy_weight: float = 0.1,
+        novelty_weight: float = 0.05,
     ):
-        """Initialize proper MCTS with multiple expert rollouts."""
-        self.dplm2_integration = dplm2_integration
-        self.baseline_structure = baseline_structure or {}
-        self._baseline_structure = self.baseline_structure  # For compatibility
-        self.reference_sequence = reference_sequence
-        self.reference_coords = reference_coords
+        """
+        Initialize HallucinationMCTS.
+        
+        Args:
+            sequence_length: Length of sequences to design
+            max_depth: Maximum tree depth
+            num_iterations: Number of MCTS iterations
+            num_rollouts: Rollouts per expansion
+            exploration_constant: UCT exploration constant
+            use_mock: Use mock models for testing
+            device: Device for models (cuda/cpu)
+            init_mode: Initialization mode (random, all_x, all_a, all_g)
+            output_dir: Directory to save PDB files
+            structure_backend: Structure prediction backend (esmfold, boltz, chai1, abcfold)
+            abcfold_engine: Engine for ABCFold (af3, boltz, chai1)
+            num_candidates: K candidates per cycle (HalluDesign style)
+            traj_mode: Trajectory mode for future AF3 diffusion control
+            ss_guidance_config: Secondary structure guidance configuration
+            seed: Random seed for reproducibility
+            use_ph_uct: Use PH-UCT (with entropy/novelty) vs standard UCT
+            entropy_weight: Weight for entropy bonus in PH-UCT
+            novelty_weight: Weight for novelty bonus in PH-UCT
+        """
+        self.sequence_length = sequence_length
         self.max_depth = max_depth
+        self.num_iterations = num_iterations
+        self.num_rollouts = num_rollouts
         self.exploration_constant = exploration_constant
-        self.use_ph_uct = use_ph_uct  # Store UCT vs PH-UCT choice
-        self.task_type = task_type  # Store task type (folding vs inverse_folding)
-        # Automatically exclude ProteinMPNN for folding tasks
-        self.exclude_proteinmpnn = exclude_proteinmpnn or (task_type == "folding")
-        if task_type == "folding" and not exclude_proteinmpnn:
-            print(f"   🔧 Auto-excluding ProteinMPNN for folding task")
-        self._last_structure_eval = None
+        self.use_mock = use_mock
+        self.device = device
+        self.init_mode = init_mode
+        self.structure_backend = structure_backend
+        self.abcfold_engine = abcfold_engine
+        self.num_candidates = num_candidates
+        self.traj_mode = traj_mode
+        self.use_ph_uct = use_ph_uct
+        self.entropy_weight = entropy_weight
+        self.novelty_weight = novelty_weight
         
-        # Multi-expert rollout parameters
-        self.ablation_mode = ablation_mode
-        self.single_expert_id = single_expert_id
-        self.external_experts = external_experts or []
-        self.num_rollouts_per_expert = num_rollouts_per_expert
-        self.top_k_candidates = top_k_candidates
-        self.num_children_select = kwargs.get('num_children_select', top_k_candidates)  # For random mode
+        # Setup output directory
+        if output_dir:
+            self.output_dir = Path(output_dir)
+        else:
+            self.output_dir = HALLUCINATION_DIR / "hallucination_outputs"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.pdb_counter = 0
         
-        # Expert configuration
-        self.experts = self._setup_experts()
-        try:
-            self.structure_converter = get_structure_converter()
-        except Exception as converter_error:
-            print(f"⚠️ Structure converter unavailable: {converter_error}")
-            self.structure_converter = None
+        # Initialize structure predictor
+        self._init_structure_predictor()
         
-        if not self.dplm2_integration:
-            raise ValueError("DPLM-2 integration is required")
-        
-        print(f"🎯 MCTS initialized: {self.ablation_mode} mode with {len(self.experts)} experts")
-    
-    def get_best_child(self, node):
-        """Get the best child node based on reward"""
-        if not hasattr(node, 'children') or not node.children:
-            return node
-        
-        best_child = node
-        best_reward = getattr(node, 'reward', 0.0)
-        
-        for child in node.children:
-            child_reward = getattr(child, 'reward', 0.0)
-            if child_reward > best_reward:
-                best_child = child
-                best_reward = child_reward
-        
-        return best_child
-    
-    def _setup_experts(self) -> List:
-        """Setup expert list based on ablation mode and task type."""
-        experts = []
-        
-        # Use the explicit exclude_proteinmpnn flag or infer from task type
-        exclude_proteinmpnn = self.exclude_proteinmpnn or (self.task_type == "folding")
-        
-        if self.ablation_mode == "single_expert":
-            # Use only one expert (DPLM-2 models or external)
-            if self.single_expert_id is not None:
-                if self.single_expert_id < 3:  # DPLM-2 models (650M, 150M, 3B)
-                    experts = [f"dplm2_{self.single_expert_id}"]
-                    print(f"   Single expert: DPLM-2 model {self.single_expert_id}")
-                elif self.single_expert_id == 3 and len(self.external_experts) > 0 and not exclude_proteinmpnn:
-                    experts = [self.external_experts[0]]  # ProteinMPNN or first external
-                    print(f"   Single expert: {experts[0].get_name() if hasattr(experts[0], 'get_name') else 'External'}")
-                else:
-                    if exclude_proteinmpnn and self.single_expert_id == 3:
-                        print(f"   ⚠️ ProteinMPNN excluded for folding task, using DPLM-2 150M instead")
-                        experts = ["dplm2_1"]  # Fallback to 150M model
-                    else:
-                        experts = ["dplm2_0"]  # Default to DPLM-2 650M
-                        print(f"   Single expert: DPLM-2 650M (default)")
-            else:
-                experts = ["dplm2_0"]  # Default
-                
-        elif self.ablation_mode == "multi_expert":
-            # Use all available experts (exclude ProteinMPNN for folding)
-            experts = ["dplm2_0", "dplm2_1", "dplm2_2"]  # All DPLM-2 models
-            if not exclude_proteinmpnn:
-                experts.extend(self.external_experts)  # Add external experts
-                print(f"   Multi-expert: {len(experts)} total experts")
-            else:
-                print(f"   Multi-expert: 3 DPLM-2 models (ProteinMPNN excluded for folding)")
-            
-        else:  # random_no_expert
-            experts = []
-            print(f"   Random mode: no expert guidance")
-        
-        return experts
-    
-    def search(self, initial_sequence: str = None, num_iterations: int = 2, 
-               reference_sequence: str = None, structure_data: dict = None, **kwargs) -> MCTSNode:
-        """
-        Proper MCTS search with diffusion and multiple expert rollouts.
-        
-        Pipeline:
-        1. PH-UCT Selection with entropy/mutual information
-        2. Progressive pLDDT masking with ESMFold
-        3. Multi-expert rollouts (N per expert) → top-K selection
-        4. Task-specific evaluation and backpropagation
-        """
-        print(f"🔍 MCTS search called with initial_sequence type: {type(initial_sequence)}, len: {len(initial_sequence) if initial_sequence is not None else 'None'}")
-        
-        # Update parameters
-        if reference_sequence:
-            self.reference_sequence = reference_sequence
-        if structure_data:
-            self.baseline_structure.update(structure_data)
-        
-        # Step 1: Use baseline pLDDT scores (following GitHub version)
-        print(f"🎯 Step 1: Using baseline pLDDT scores...")
-        print(f"   🔍 Baseline structure keys: {list(self.baseline_structure.keys())}")
-        print(f"   🔍 Baseline plddt_scores type: {type(self.baseline_structure.get('plddt_scores'))}")
-        try:
-            raw_plddt = self.baseline_structure.get('plddt_scores')
-            initial_plddt = self._prepare_plddt_scores(len(initial_sequence), raw_plddt)
-            print(f"   🔍 Initial pLDDT type: {type(raw_plddt)}, length: {len(initial_plddt) if initial_plddt is not None else 'None'}")
-        except Exception as e:
-            print(f"   ❌ Error getting initial pLDDT: {e}")
-            initial_plddt = [70.0] * len(initial_sequence)
-        
-        # Step 2: Progressive pLDDT masking (quantile-based)
-        print(f"🎯 Step 2: Progressive pLDDT masking...")
-        masked_positions = self._compute_progressive_plddt_masking(initial_sequence, initial_plddt, depth=0)
-        
-        initial_structure_tokens = self.baseline_structure.get('struct_seq')
-        initial_token_list = self._get_structure_token_list(initial_structure_tokens, len(initial_sequence))
-        normalized_struct_seq = ' '.join(initial_token_list)
-        self.baseline_structure['struct_seq'] = normalized_struct_seq
-        initial_coordinates = self.baseline_structure.get('coordinates')
-        root_reward_raw = self.baseline_structure.get('baseline_reward', 0.0)
-        root_reward_value = float(root_reward_raw) if root_reward_raw is not None else 0.0
-        root_visits = 1
-        root_total_reward = root_reward_value
-        baseline_rmsd = self.baseline_structure.get('baseline_rmsd')
-        baseline_tm = self.baseline_structure.get('baseline_tm')
-        
-        # Create root node with baseline structure context
-        root = MCTSNode(
-            sequence=initial_sequence,
-            mutable_positions=masked_positions,  # These are the low-confidence positions
-            depth=0,
-            plddt_scores=initial_plddt,
-            reward=root_reward_value,
-            total_reward=root_total_reward,
-            visits=root_visits,
-            structure_tokens=normalized_struct_seq,
-            coordinates=initial_coordinates,
-            rmsd=baseline_rmsd,
-            tm_score=baseline_tm,
+        # Initialize inverse folding (ProteinMPNN via hallucination expert)
+        print(f"Initializing ProteinMPNN (mock={use_mock})...")
+        self.hallucination_expert = create_hallucination_expert(
+            structure_backend=structure_backend,
+            abcfold_engine=abcfold_engine,
+            esmfold_device=device,
+            use_mock=use_mock,
+            use_real_proteinmpnn=not use_mock,
         )
         
-        print(f"🎯 MCTS Search: {num_iterations} iterations")
-        print(f"   Initial masking: {len(masked_positions)}/{len(initial_sequence)} positions ({len(masked_positions)/len(initial_sequence)*100:.1f}%)")
-        print(f"   pLDDT range: {min(initial_plddt):.1f}-{max(initial_plddt):.1f}, avg={sum(initial_plddt)/len(initial_plddt):.1f}")
-        
-        # MCTS iterations
-        for iteration in range(num_iterations):
-            print(f"\n🔄 Iteration {iteration + 1}/{num_iterations}")
-            
-            # Step 1: UCT/PH-UCT Selection
-            selected_node = self._uct_selection(root)
-            print(f"   Selected node at depth {selected_node.depth}")
-            
-            # Step 2: Expansion with multi-expert rollouts
-            if selected_node.depth < self.max_depth and len(selected_node.masked_positions) > 0:
-                self._expand_with_multi_expert_rollouts(selected_node)
-            
-            # Step 3: Evaluation and Backpropagation
-            if selected_node.children:
-                # Find best child and backpropagate
-                best_child = max(selected_node.children, key=lambda c: c.reward)
-                self._backpropagate_max_rule(best_child)
-                print(f"   Best child: reward={best_child.reward:.3f}, expert={best_child.expert_source}")
-        
-        # Return best node from entire tree
-        return self._find_best_node_in_tree(root)
-    
-    def _uct_selection(self, root: MCTSNode) -> MCTSNode:
-        """UCT or PH-UCT selection based on use_ph_uct parameter."""
-        node = root
-        while node.children and len(node.masked_positions) > 0:
-            if self.use_ph_uct:
-                # Select child with highest PH-UCT score (with entropy/novelty bonuses)
-                best_child = max(node.children, key=lambda c: c.ph_uct_score(self.exploration_constant))
-            else:
-                # Select child with highest standard UCT score (no bonuses)
-                best_child = max(node.children, key=lambda c: c.uct_score(self.exploration_constant))
-            node = best_child
-        return node
-    
-    def _expand_with_multi_expert_rollouts(self, node: MCTSNode):
-        """
-        PROPER Multi-Expert Rollouts (from backup MCTS):
-        1. Use FIXED structure tokens from struct.fasta
-        2. N rollouts per expert (DPLM-2 + external experts)
-        3. Top-K candidate selection from ALL rollouts
-        4. Progressive pLDDT masking for child nodes
-        """
-        if len(node.masked_positions) == 0:
-            return
-        
-        print(f"   🌱 Expanding node: {len(node.masked_positions)} masked positions")
-        
-        # Step 1: Collect all candidates from all experts
-        all_candidates = []
-        
-        # Random mode: generate random candidates without expert guidance
-        if self.ablation_mode == "random_no_expert":
-            print(f"      🎲 Random mode: generating {self.num_children_select} random candidates")
-            import random
-            
-            for i in range(self.num_children_select):
-                try:
-                    if self.task_type == "folding":
-                        # For folding: randomly perturb structure tokens
-                        # Get structure token vocabulary range (DPLM-2 structure tokens are typically 2816-7999)
-                        struct_token_start = 2816
-                        struct_token_end = 7999
-                        
-                        # Parse baseline structure tokens
-                        baseline_tokens = node.structure_tokens
-                        if isinstance(baseline_tokens, str):
-                            token_list = baseline_tokens.split()
-                        else:
-                            token_list = list(baseline_tokens)
-                        
-                        # Randomly replace some masked positions with random structure tokens
-                        new_token_list = token_list.copy()
-                        masked_positions = list(node.masked_positions) if node.masked_positions else []
-                        
-                        # Randomly select a subset of masked positions to perturb
-                        if masked_positions:
-                            num_to_perturb = max(1, len(masked_positions) // 2)
-                            positions_to_perturb = random.sample(masked_positions, min(num_to_perturb, len(masked_positions)))
-                            
-                            for pos in positions_to_perturb:
-                                if pos < len(new_token_list):
-                                    # Replace with random structure token
-                                    new_token_list[pos] = str(random.randint(struct_token_start, struct_token_end))
-                        
-                        new_struct_tokens = ' '.join(new_token_list)
-                        
-                        # Convert to coordinates for evaluation
-                        coords, plddt = self.dplm2_integration._structure_tokens_to_coords(new_struct_tokens, len(node.sequence))
-                        
-                        if coords is not None:
-                            reward = self._evaluate_structure_reward(coords, node.sequence)
-                            pl_scores = plddt if plddt is not None else self._estimate_plddt_from_coords(coords)
-                            metrics = self._last_structure_eval or {}
-                            
-                            candidate_data = {
-                                'sequence': node.sequence,
-                                'structure_tokens': new_struct_tokens,
-                                'coordinates': coords,
-                                'plddt_scores': pl_scores,
-                                'expert': 'random',
-                                'entropy': 0.0,
-                                'reward': reward,
-                                'rollout_id': i,
-                                'confidence': 0.5,
-                                'rmsd': metrics.get('rmsd'),
-                                'tm_score': metrics.get('tm_score'),
-                            }
-                            all_candidates.append(candidate_data)
-                            print(f"         ✅ Random candidate {i+1}: reward={reward:.3f}, perturbed {len(positions_to_perturb) if masked_positions else 0} positions")
-                        else:
-                            print(f"         ❌ Random candidate {i+1}: failed to convert tokens to coords")
-                    else:
-                        # For inverse folding: randomly mutate sequence
-                        # Just use baseline as random baseline for inverse folding
-                        candidate_data = {
-                            'sequence': node.sequence,
-                            'expert': 'random',
-                            'entropy': 0.0,
-                            'reward': node.reward if node.reward is not None else 0.0,
-                            'rollout_id': i,
-                            'confidence': 0.5
-                        }
-                        all_candidates.append(candidate_data)
-                        print(f"         ✅ Random candidate {i+1}: reward={candidate_data['reward']:.3f}")
-                        
-                except Exception as e:
-                    print(f"         ❌ Random candidate {i+1}: error {e}")
-                    import traceback
-                    traceback.print_exc()
-        
-        # DPLM-2 Expert Rollouts (multiple model sizes)
-        dplm2_experts = ["dplm2_0", "dplm2_1", "dplm2_2"]  # 650M, 150M, 3B
-        
-        # Skip DPLM-2 experts for random_no_expert mode
-        if self.ablation_mode != "random_no_expert":
-            for expert_id, expert_name in enumerate(dplm2_experts):
-                if self.ablation_mode == "single_expert" and expert_id != (self.single_expert_id or 0):
-                    continue  # Skip if not the selected single expert
-                    
-                print(f"      🤖 {expert_name}: generating {self.num_rollouts_per_expert} rollouts")
-                
-                # N rollouts per DPLM-2 expert
-                for rollout in range(self.num_rollouts_per_expert):
-                    try:
-                        candidate_data = self._generate_dplm2_candidate(
-                            node, node.masked_positions, expert_id
-                        )
-                        
-                        if not candidate_data:
-                            continue
-                        
-                        if self.task_type == "folding":
-                            coords = candidate_data.get('coordinates')
-                            struct_tokens = candidate_data.get('structure_tokens')
-                            if coords is None or struct_tokens is None:
-                                print(f"         ❌ {expert_name} rollout {rollout+1}: missing coordinates or structure tokens")
-                                continue
-                            reward = self._evaluate_structure_reward(coords, node.sequence)
-                            pl_scores = candidate_data.get('plddt_scores') if candidate_data.get('plddt_scores') is not None else self._estimate_plddt_from_coords(coords)
-                            metrics = self._last_structure_eval or {}
-                            all_candidates.append({
-                                'sequence': node.sequence,
-                                'structure_tokens': struct_tokens,
-                                'coordinates': coords,
-                                'plddt_scores': pl_scores,
-                                'expert': expert_name,
-                                'entropy': 0.0,
-                                'reward': reward,
-                                'rollout_id': rollout,
-                                'confidence': 0.8,
-                                'rmsd': metrics.get('rmsd'),
-                                'tm_score': metrics.get('tm_score'),
-                            })
-                            print(f"         ✅ {expert_name} rollout {rollout+1}: reward={reward:.3f}")
-                        else:
-                            candidate_seq = candidate_data.get('sequence')
-                            if candidate_seq and len(candidate_seq) == len(node.sequence):
-                                entropy = self._compute_expert_entropy(candidate_seq, expert_name, node.masked_positions)
-                                reward = self._evaluate_sequence_aar(candidate_seq)
-                                all_candidates.append({
-                                    'sequence': candidate_seq,
-                                    'expert': expert_name,
-                                    'entropy': entropy,
-                                    'reward': reward,
-                                    'rollout_id': rollout,
-                                    'confidence': 0.8
-                                })
-                                print(f"         ✅ {expert_name} rollout {rollout+1}: reward={reward:.3f}")
-                            else:
-                                print(f"         ❌ {expert_name} rollout {rollout+1}: invalid sequence length")
-                            
-                    except Exception as e:
-                        print(f"         ❌ {expert_name} rollout {rollout+1}: error {e}")
-        # Note: Random mode is handled at the top (lines 335-412), so no else block needed here
-        
-        # ProteinMPNN Expert Rollouts (Expert 3) - Only if not excluded
-        if not self.exclude_proteinmpnn and self.ablation_mode == "single_expert" and self.single_expert_id == 3:
-            # Use ProteinMPNN through DPLM2 integration
-            print(f"      🤖 ProteinMPNN (expert 3): generating {self.num_rollouts_per_expert} rollouts")
-            
-            for rollout in range(self.num_rollouts_per_expert):
-                try:
-                    candidate = self._generate_proteinmpnn_candidate(
-                        node.sequence, node.masked_positions
-                    )
-                    
-                    if candidate and len(candidate) == len(node.sequence):
-                        # Compute entropy and reward
-                        entropy = self._compute_expert_entropy(candidate, "ProteinMPNN", node.masked_positions)
-                        reward = self._evaluate_sequence_aar(candidate)
-                        
-                        all_candidates.append({
-                            'sequence': candidate,
-                            'expert': "ProteinMPNN",
-                            'entropy': entropy,
-                            'reward': reward,
-                            'rollout_id': rollout,
-                            'confidence': 0.7  # High confidence for ProteinMPNN
-                        })
-                        print(f"         ✅ ProteinMPNN rollout {rollout+1}: reward={reward:.3f}")
-                    else:
-                        print(f"         ❌ ProteinMPNN rollout {rollout+1}: invalid sequence")
-                        
-                except Exception as e:
-                    print(f"         ❌ ProteinMPNN rollout {rollout+1}: error {e}")
-        
-        # Multi-expert mode: include all DPLM-2 + ProteinMPNN (if not excluded)
-        elif not self.exclude_proteinmpnn and self.ablation_mode == "multi_expert":
-            # Add ProteinMPNN rollouts
-            print(f"      🤖 ProteinMPNN (expert 3): generating {self.num_rollouts_per_expert} rollouts")
-            
-            for rollout in range(self.num_rollouts_per_expert):
-                try:
-                    candidate = self._generate_proteinmpnn_candidate(
-                        node.sequence, node.masked_positions
-                    )
-                    
-                    if candidate and len(candidate) == len(node.sequence):
-                        entropy = self._compute_expert_entropy(candidate, "ProteinMPNN", node.masked_positions)
-                        reward = self._evaluate_sequence_aar(candidate)
-                        
-                        all_candidates.append({
-                            'sequence': candidate,
-                            'expert': "ProteinMPNN",
-                            'entropy': entropy,
-                            'reward': reward,
-                            'rollout_id': rollout,
-                            'confidence': 0.7
-                        })
-                        print(f"         ✅ ProteinMPNN rollout {rollout+1}: reward={reward:.3f}")
-                    else:
-                        print(f"         ❌ ProteinMPNN rollout {rollout+1}: invalid sequence")
-                        
-                except Exception as e:
-                    print(f"         ❌ ProteinMPNN rollout {rollout+1}: error {e}")
-        
-        # External experts (e.g., hallucination expert)
-        if self.external_experts and self.ablation_mode != "random_no_expert":
-            for expert in self.external_experts:
-                # Check if expert has generate_candidate method
-                if not hasattr(expert, 'generate_candidate'):
-                    continue
-                
-                expert_name = expert.get_name() if hasattr(expert, 'get_name') else 'external'
-                print(f"      🤖 {expert_name}: generating {self.num_rollouts_per_expert} rollouts")
-                
-                for rollout in range(self.num_rollouts_per_expert):
-                    try:
-                        # Call expert's generate_candidate method
-                        candidate_data = expert.generate_candidate(
-                            sequence=node.sequence,
-                            masked_positions=node.masked_positions,
-                            coordinates=node.coordinates
-                        )
-                        
-                        if not candidate_data:
-                            print(f"         ❌ {expert_name} rollout {rollout+1}: no candidate returned")
-                            continue
-                        
-                        # Evaluate reward based on task type
-                        if self.task_type == "folding":
-                            # For folding: evaluate structure quality
-                            coords = candidate_data.get('coordinates')
-                            if coords is None:
-                                print(f"         ❌ {expert_name} rollout {rollout+1}: missing coordinates")
-                                continue
-                            
-                            reward = self._evaluate_structure_reward(coords, candidate_data['sequence'])
-                            pl_scores = candidate_data.get('plddt_scores', candidate_data.get('confidence_scores'))
-                            if pl_scores is None:
-                                pl_scores = self._estimate_plddt_from_coords(coords)
-                            
-                            metrics = self._last_structure_eval or {}
-                            all_candidates.append({
-                                'sequence': candidate_data['sequence'],
-                                'structure_tokens': None,  # Hallucination doesn't use structure tokens
-                                'coordinates': coords,
-                                'plddt_scores': pl_scores,
-                                'expert': expert_name,
-                                'entropy': candidate_data.get('entropy', 0.5),
-                                'reward': reward,
-                                'rollout_id': rollout,
-                                'confidence': candidate_data.get('mean_plddt', 70.0) / 100.0,
-                                'rmsd': metrics.get('rmsd'),
-                                'tm_score': metrics.get('tm_score'),
-                            })
-                            print(f"         ✅ {expert_name} rollout {rollout+1}: reward={reward:.3f}")
-                            
-                        else:
-                            # For inverse folding: evaluate sequence quality
-                            sequence = candidate_data['sequence']
-                            if len(sequence) != len(node.sequence):
-                                print(f"         ❌ {expert_name} rollout {rollout+1}: length mismatch")
-                                continue
-                            
-                            reward = self._evaluate_sequence_aar(sequence)
-                            entropy = candidate_data.get('entropy', 0.5)
-                            
-                            all_candidates.append({
-                                'sequence': sequence,
-                                'coordinates': candidate_data.get('coordinates'),
-                                'plddt_scores': candidate_data.get('plddt_scores'),
-                                'expert': expert_name,
-                                'entropy': entropy,
-                                'reward': reward,
-                                'rollout_id': rollout,
-                                'confidence': candidate_data.get('mean_plddt', 70.0) / 100.0
-                            })
-                            print(f"         ✅ {expert_name} rollout {rollout+1}: reward={reward:.3f}")
-                        
-                    except Exception as e:
-                        print(f"         ❌ {expert_name} rollout {rollout+1}: error {e}")
-                        import traceback
-                        traceback.print_exc()
-        
-        # Step 2: Select top-K candidates from ALL rollouts
-        if not all_candidates:
-            print(f"      ⚠️ No successful candidates generated")
-            return
-        
-        # Sort by reward and take top-K
-        all_candidates.sort(key=lambda x: x['reward'], reverse=True)
-        top_candidates = all_candidates[:self.top_k_candidates]
-        
-        print(f"      📊 Selected {len(top_candidates)} from {len(all_candidates)} total candidates")
-        
-        # Step 3: Create child nodes with progressive masking
-        for i, candidate in enumerate(top_candidates):
-            if self.task_type == "folding":
-                # Try to get plddt_scores from candidate, otherwise estimate from coords if available
-                child_plddt = candidate.get('plddt_scores')
-                if child_plddt is None:
-                    coords = candidate.get('coordinates')
-                    if coords is not None:
-                        child_plddt = self._estimate_plddt_from_coords(coords)
-                    else:
-                        # No coords available, use baseline or uniform default
-                        baseline_plddt = self.baseline_structure.get('plddt_scores')
-                        if baseline_plddt is not None:
-                            child_plddt = self._prepare_plddt_scores(len(candidate['sequence']), baseline_plddt)
-                        else:
-                            child_plddt = [70.0] * len(candidate['sequence'])
-            else:
-                child_plddt_raw = self.baseline_structure.get('plddt_scores')
-                child_plddt = self._prepare_plddt_scores(len(candidate['sequence']), child_plddt_raw)
-            child_masked_positions = self._compute_progressive_plddt_masking(
-                candidate['sequence'], child_plddt, depth=node.depth + 1
-            )
-            
-            # CORRECT FIX: Child nodes should get the generated sequence for progress
-            # The masking consistency issue is about rollout generation, not child creation
-            # All rollouts at same depth use same parent node.sequence (which is correct)
-            # But child nodes should progress with generated sequences
-            generated_sequence = candidate['sequence']
-            
-            child = MCTSNode(
-                sequence=generated_sequence,  # Use generated sequence for progress
-                mutable_positions=child_masked_positions,  # New masking for next depth
-                parent=node,
-                depth=node.depth + 1,
-                plddt_scores=child_plddt,
-                entropy=candidate['entropy'],
-                novelty=self._compute_novelty(generated_sequence, node),
-                expert_source=candidate['expert'],
-                reward=candidate['reward'],
-                visits=1,
-                total_reward=candidate['reward'],
-                structure_tokens=candidate.get('structure_tokens', node.structure_tokens),
-                coordinates=candidate.get('coordinates', node.coordinates),
-                rmsd=candidate.get('rmsd', node.rmsd),
-                tm_score=candidate.get('tm_score', node.tm_score),
-            )
-            node.children.append(child)
-            
-            print(f"         Child {i+1}: {candidate['expert']}, reward={candidate['reward']:.3f}, entropy={candidate['entropy']:.3f}")
-    
-    def _generate_real_structure_tokens(self, sequence: str) -> Optional[str]:
-        """Generate REAL structure tokens from ESMFold coordinates for MCTS lead optimization."""
-        try:
-            print(f"      🔍 MCTS Lead Optimization: generating REAL structure tokens from ESMFold")
-            
-            # Step 1: Generate ESMFold baseline coordinates
-            coords = self._generate_esmfold_baseline(sequence)
-            if coords is None:
-                print(f"      ❌ Failed to generate ESMFold baseline")
-                return None
-            
-            # Step 2: Convert coordinates to REAL structure tokens
-            structure_tokens = self._coords_to_structure_tokens(coords)
-            if structure_tokens:
-                print(f"      ✅ Generated REAL structure tokens: {len(structure_tokens)} chars")
-                print(f"      🔍 Sample: {structure_tokens[:50]}...")
-                return structure_tokens
-            else:
-                print(f"      ❌ Failed to convert coordinates to structure tokens")
-                return None
-                
-        except Exception as e:
-            print(f"      ❌ Structure token generation failed: {e}")
-            return None
-    
-    def _generate_esmfold_baseline(self, sequence: str) -> Optional[np.ndarray]:
-        """Generate baseline structure using ESMFold (following GitHub repository)."""
-        try:
-            print(f"      🔄 Generating ESMFold baseline for sequence length {len(sequence)}")
-            
-            # Import ESMFold
-            import torch
-            from transformers import EsmForProteinFolding, AutoTokenizer
-            
-            # Load ESMFold model
-            model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
-            tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
-            
-            device = next(self.dplm2_integration.model.parameters()).device
-            model = model.to(device)
-            model.eval()
-            
-            # Tokenize and predict
-            with torch.no_grad():
-                tokenized = tokenizer(sequence, return_tensors="pt", add_special_tokens=False)
-                tokenized = {k: v.to(device) for k, v in tokenized.items()}
-                
-                output = model(tokenized['input_ids'])
-                positions = output.positions  # Shape: [batch, length, atoms, 3]
-                
-                print(f"      🔍 ESMFold output shape: {positions.shape}")
-                
-                # Handle different ESMFold output shapes
-                if len(positions.shape) == 5:
-                    # Shape: [batch, 1, length, atoms, 3] 
-                    ca_coords = positions[0, 0, :, 1, :].cpu().numpy()  # [length, 3]
-                elif len(positions.shape) == 4:
-                    # Shape: [batch, length, atoms, 3]
-                    ca_coords = positions[0, :, 1, :].cpu().numpy()  # [length, 3]
-                else:
-                    raise ValueError(f"Unexpected ESMFold output shape: {positions.shape}")
-                
-                # Ensure we have the right sequence length
-                expected_len = len(sequence)
-                if ca_coords.shape[0] != expected_len:
-                    print(f"      ⚠️ Length mismatch: got {ca_coords.shape[0]}, expected {expected_len}")
-                    # Pad or truncate to match sequence length
-                    if ca_coords.shape[0] < expected_len:
-                        # Pad with last coordinate
-                        padding = np.tile(ca_coords[-1:], (expected_len - ca_coords.shape[0], 1))
-                        ca_coords = np.vstack([ca_coords, padding])
-                    else:
-                        # Truncate to sequence length
-                        ca_coords = ca_coords[:expected_len]
-                
-            print(f"      ✅ ESMFold baseline generated: {ca_coords.shape}")
-            return ca_coords
-            
-        except Exception as e:
-            print(f"      ❌ ESMFold baseline generation failed: {e}")
-            # Fallback to random coordinates
-            coords = np.random.rand(len(sequence), 3) * 10
-            print(f"      🔧 Using random fallback coordinates: {coords.shape}")
-            return coords
-    
-    def _coords_to_structure_tokens(self, coords: np.ndarray) -> Optional[str]:
-        """Convert 3D coordinates to DPLM structure tokens (following GitHub repository)."""
-        try:
-            print(f"      🔄 Converting coordinates to structure tokens: {coords.shape}")
-            
-            from byprot.models.utils import get_struct_tokenizer
-            import torch
-            
-            # Load structure tokenizer
+        # Initialize SS guidance
+        self.ss_guidance_config = ss_guidance_config or SSGuidanceConfig()
+        self.ss_guidance = None
+        if self.ss_guidance_config.ss_guidance != "none":
             try:
-                struct_tokenizer = get_struct_tokenizer()
-                device = next(self.dplm2_integration.model.parameters()).device
-                struct_tokenizer = struct_tokenizer.to(device)
-                print(f"      ✅ Loaded struct tokenizer on {device}")
+                self.ss_guidance = SSGuidance(self.ss_guidance_config)
             except Exception as e:
-                print(f"      ❌ Failed to load struct tokenizer: {e}")
-                # Fallback to mask tokens if tokenizer fails
-                seq_len = coords.shape[0]
-                struct_tokens = '<cls_struct> ' + '<mask_struct> ' * seq_len + '<eos_struct>'
-                print(f"      🔧 Fallback to mask tokens: {seq_len} positions")
-                return struct_tokens
-            
-            seq_len = coords.shape[0]
-            
-            # Create full atom positions with CA coordinates
-            full_coords = torch.zeros((1, seq_len, 37, 3), dtype=torch.float32, device=device)
-            
-            # Handle coordinate tensor conversion properly
-            coords_tensor = torch.from_numpy(coords.astype(np.float32)).to(device)
-            if len(coords_tensor.shape) == 2 and coords_tensor.shape[0] == seq_len:
-                # Shape: [seq_len, 3] - correct format
-                full_coords[0, :, 1, :] = coords_tensor  # CA at index 1
-            else:
-                print(f"      ⚠️ Unexpected coordinate shape: {coords_tensor.shape}, expected [{seq_len}, 3]")
-                # Try to reshape or handle the mismatch
-                if coords_tensor.numel() == seq_len * 3:
-                    coords_tensor = coords_tensor.reshape(seq_len, 3)
-                    full_coords[0, :, 1, :] = coords_tensor
-                else:
-                    raise ValueError(f"Cannot reshape coordinates: {coords_tensor.shape} to [{seq_len}, 3]")
-            
-            # Create residue mask (all positions valid)
-            res_mask = torch.ones((1, seq_len), dtype=torch.bool, device=device)
-            seq_length = torch.tensor([seq_len], device=device)
-            
-            # Tokenize coordinates to get REAL structure tokens
-            struct_ids = struct_tokenizer.tokenize(full_coords, res_mask, seq_length)
-            struct_seq = struct_tokenizer.struct_ids_to_seq(struct_ids.cpu().tolist()[0])
-            
-            print(f"      ✅ Generated REAL structure tokens: {len(struct_seq)} chars")
-            return struct_seq
-            
-        except Exception as e:
-            print(f"      ❌ Structure token conversion failed: {e}")
-            # Ultimate fallback
-            try:
-                seq_len = coords.shape[0] if coords is not None else 100
-                struct_tokens = '<cls_struct> ' + '<mask_struct> ' * seq_len + '<eos_struct>'
-                print(f"      🔧 Using ultimate fallback structure mask tokens: {seq_len} positions")
-                return struct_tokens
-            except:
-                return None
+                print(f"Warning: SS guidance initialization failed: {e}")
+                self.ss_guidance = None
+        
+        # Set random seed
+        self.seed = seed
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+        
+        # Create run directory for SS guidance artifacts
+        self.run_dir = None
+        if self.ss_guidance and self.ss_guidance_config.ss_guidance != "none":
+            self.run_dir = create_run_directory(self.ss_guidance_config, seed)
+            print(f"   SS guidance: {self.ss_guidance_config.ss_guidance}")
+            print(f"   Run dir: {self.run_dir}")
+        
+        # Override init_mode based on SS guidance variant
+        if self.ss_guidance_config.ss_guidance == "beta_lock_reinit_helix":
+            self.init_mode = "random"
+        elif self.ss_guidance_config.ss_guidance in ("x_init_helix_pg", "x_init_beta_template", "x_init_ligand_first"):
+            self.init_mode = "all_x"
+        
+        print(f"HallucinationMCTS initialized")
+        print(f"   Sequence length: {sequence_length}")
+        print(f"   Max depth: {max_depth}")
+        print(f"   Iterations: {num_iterations}")
+        print(f"   Init mode: {self.init_mode}")
+        print(f"   Structure backend: {structure_backend}")
+        print(f"   Use PH-UCT: {use_ph_uct}")
+        print(f"   Output dir: {self.output_dir}")
     
-    def _prepare_plddt_scores(self, sequence_length: int, raw_scores) -> List[float]:
-        """Normalize raw pLDDT inputs into a length-matched float list in [0, 100]."""
-        try:
-            if raw_scores is None:
-                raise ValueError("No pLDDT scores provided")
-            
-            # Handle dict-style payloads (common in cached metadata)
-            if isinstance(raw_scores, dict):
-                candidates = ['plddt_scores', 'plddt', 'scores', 'confidence', 'lddts']
-                selected = None
-                for key in candidates:
-                    if key in raw_scores and raw_scores[key]:
-                        selected = raw_scores[key]
-                        break
-                if selected is None and raw_scores:
-                    # Fallback: take first non-empty value
-                    for value in raw_scores.values():
-                        if value:
-                            selected = value
-                            break
-                raw_scores = selected if selected is not None else []
-            
-            # Convert numpy arrays / tensors to list
-            if hasattr(raw_scores, 'cpu'):
-                raw_scores = raw_scores.cpu()
-            if hasattr(raw_scores, 'numpy'):
-                raw_scores = raw_scores.numpy()
-            if isinstance(raw_scores, np.ndarray):
-                raw_scores = raw_scores.tolist()
-            
-            # Ensure list type
-            if not isinstance(raw_scores, (list, tuple)):
-                raw_scores = [float(raw_scores)]
-            
-            scores = [float(x) for x in raw_scores if x is not None]
-        except Exception as e:
-            print(f"   ⚠️ Failed to parse raw pLDDT scores ({e}); using default 70.0.")
-            scores = []
+    def _init_structure_predictor(self):
+        """Initialize structure prediction backend."""
+        backend = self.structure_backend.lower()
         
-        if not scores:
-            scores = [70.0] * sequence_length
-        else:
-            # If scores appear normalized to [0, 1], rescale
-            max_score = max(scores)
-            if max_score <= 1.5:
-                scores = [min(1.0, max(0.0, s)) * 100.0 for s in scores]
-            # Crop or pad to match sequence length
-            if len(scores) >= sequence_length:
-                scores = scores[:sequence_length]
-            else:
-                pad_value = float(np.mean(scores)) if scores else 70.0
-                scores = scores + [pad_value] * (sequence_length - len(scores))
-        
-        return scores
-
-    def _compute_progressive_plddt_masking(self, sequence: str, plddt_scores: List[float], depth: int) -> Set[int]:
-        """Progressive pLDDT masking: threshold-based by default, quantile-based as fallback."""
-        print(f"   🔍 _compute_progressive_plddt_masking: plddt_scores type={type(plddt_scores)}, len={len(plddt_scores) if plddt_scores is not None else 'None'}")
-        
-        if plddt_scores is None or (isinstance(plddt_scores, (list, np.ndarray)) and len(plddt_scores) == 0):
-            print(f"      ⚠️ Empty pLDDT scores received; defaulting to uniform 70.0 confidence.")
-            plddt_scores = [70.0] * len(sequence)
-        elif len(plddt_scores) != len(sequence):
-            print(f"      ⚠️ pLDDT length mismatch ({len(plddt_scores)} vs {len(sequence)}); padding/cropping.")
-            plddt_scores = self._prepare_plddt_scores(len(sequence), plddt_scores)
-        
-        # Progressive thresholds by depth (lower threshold = more masking)
-        if depth == 0:
-            threshold = 70.0  # Mask positions with pLDDT < 70
-            target_ratio = 0.25  # Fallback: mask ~25% at root
-        elif depth == 1:
-            threshold = 75.0  # Mask positions with pLDDT < 75
-            target_ratio = 0.20  # Fallback: mask ~20% one level down
-        elif depth == 2:
-            threshold = 80.0  # Mask positions with pLDDT < 80
-            target_ratio = 0.15  # Fallback: mask ~15% deeper
-        elif depth == 3:
-            threshold = 85.0  # Mask positions with pLDDT < 85
-            target_ratio = 0.05  # Fallback: mask ~5% at depth 3
-        elif depth >= 4:
-            # At max depth (4+), unmask all remaining X positions for 100% completion
-            threshold = 100.0  # No positions meet this threshold
-            target_ratio = 0.0   # Force complete unmasking
-        
-        # Method 1: Threshold-based masking (default)
-        threshold_masked = set([i for i, score in enumerate(plddt_scores) if score < threshold])
-        
-        # Check if threshold masking gives reasonable number of positions
-        min_positions = max(3, int(len(sequence) * 0.05))  # At least 5% or 3 positions
-        max_positions = int(len(sequence) * 0.30)  # At most 30% of sequence
-        
-        if min_positions <= len(threshold_masked) <= max_positions:
-            # Threshold masking is good
-            masked_positions = threshold_masked
-            print(f"      🎭 Depth {depth} threshold masking (pLDDT < {threshold}): {len(masked_positions)}/{len(sequence)} positions ({len(masked_positions)/len(sequence)*100:.1f}%)")
-        else:
-            # Method 2: Quantile-based masking (fallback)
-            num_to_mask = max(min_positions, int(len(sequence) * target_ratio))
-            num_to_mask = min(num_to_mask, max_positions)
-            
-            # Sort positions by pLDDT (lowest confidence first)
-            position_scores = [(i, score) for i, score in enumerate(plddt_scores)]
-            position_scores.sort(key=lambda x: x[1])
-            
-            # Take lowest confidence positions
-            masked_positions = set([pos for pos, _ in position_scores[:num_to_mask]])
-            actual_ratio = len(masked_positions) / len(sequence) if sequence else 0.0
-            print(f"      🎭 Depth {depth} quantile masking (fallback): {len(masked_positions)}/{len(sequence)} positions ({actual_ratio*100:.1f}%)")
-            print(f"         Reason: Threshold masking gave {len(threshold_masked)} positions (outside {min_positions}-{max_positions} range)")
-        
-        return masked_positions
-    
-    def _get_structure_token_list(self, struct_seq: Optional[Union[str, List[str]]], seq_length: int) -> List[str]:
-        """Normalize structure tokens to a list of digits/masks with length seq_length."""
-        tokens: List[str] = []
-        if isinstance(struct_seq, list):
-            tokens = [str(t).strip() for t in struct_seq if str(t).strip()]
-        elif struct_seq:
-            if ',' in struct_seq:
-                tokens = [t.strip() for t in struct_seq.split(',') if t.strip()]
-            else:
-                tokens = [t.strip() for t in struct_seq.split() if t.strip()]
-        
-        filtered_tokens: List[str] = []
-        for token in tokens:
-            if token.isdigit() or token == '<mask_struct>':
-                filtered_tokens.append(token)
-        
-        if len(filtered_tokens) < seq_length:
-            filtered_tokens.extend(['<mask_struct>'] * (seq_length - len(filtered_tokens)))
-        else:
-            filtered_tokens = filtered_tokens[:seq_length]
-        
-        if not filtered_tokens:
-            filtered_tokens = ['<mask_struct>'] * seq_length
-        
-        return filtered_tokens
-    
-    def _generate_dplm2_candidate(self, node: MCTSNode, masked_positions: Set[int], expert_id: int) -> Optional[Dict]:
-        """Generate candidate using DPLM-2 for current node context."""
-        sequence = node.sequence
-        try:
-            if self.task_type == "folding":
-                struct_seq = node.structure_tokens or self.baseline_structure.get('struct_seq', '')
-                struct_tokens = self._get_structure_token_list(struct_seq, len(sequence))
-                struct_tokens = struct_tokens.copy()
-                for pos in masked_positions:
-                    if 0 <= pos < len(struct_tokens):
-                        struct_tokens[pos] = '<mask_struct>'
-                masked_struct_seq = ' '.join(struct_tokens)
-                
-                structure_data = {
-                    'sequence': sequence,
-                    'struct_seq': masked_struct_seq,
-                    'length': len(sequence),
-                    'target_length': len(sequence),
-                    'task': self.task_type,
-                    'task_type': self.task_type
-                }
-                generation_output = self.dplm2_integration.generate_with_expert(
-                    expert_id=expert_id,
-                    structure=structure_data,
-                    target_length=len(sequence),
-                    masked_sequence=None,
-                    temperature=1.0
-                )
-                if generation_output is None:
-                    print(f"      ⚠️ Expert {expert_id} failed to generate structure tokens")
-                    return None
-                generation_data = getattr(self.dplm2_integration, '_last_generation_data', {}) or {}
-                generated_struct_tokens = generation_data.get('structure_sequence')
-                if not generated_struct_tokens:
-                    print(f"      ⚠️ Expert {expert_id} returned no structure tokens via last_generation_data")
-                    return None
-                coords = self._structure_tokens_to_coords(generated_struct_tokens, len(sequence))
-                if coords is None:
-                    print(f"      ⚠️ Expert {expert_id} structure detokenization failed")
-                    return None
-                pl_ddt = self._estimate_plddt_from_coords(coords)
-                return {
-                    'sequence': sequence,
-                    'structure_tokens': generated_struct_tokens,
-                    'coordinates': coords,
-                    'plddt_scores': pl_ddt
-                }
-            else:
-                # CRITICAL FIX: Create masked sequence for DPLM-2 input, but return COMPLETE sequence
-                masked_sequence = list(sequence)
-                for pos in masked_positions:
-                    masked_sequence[pos] = 'X'
-                masked_seq_str = ''.join(masked_sequence)
-                struct_seq = self.baseline_structure.get('struct_seq', '')
-                struct_tokens = self._get_structure_token_list(struct_seq, len(sequence))
-                struct_seq_normalized = ' '.join(struct_tokens)
-                structure_data = {
-                    'struct_seq': struct_seq_normalized,
-                    'sequence': masked_seq_str,
-                    'length': len(sequence),
-                    'target_length': len(sequence),
-                    'task': self.task_type,
-                    'task_type': self.task_type
-                }
-                generated_sequence = self.dplm2_integration.generate_with_expert(
-                    expert_id=expert_id,
-                    structure=structure_data,
-                    target_length=len(sequence),
-                    masked_sequence=masked_seq_str,
-                    temperature=1.0
-                )
-                
-                if generated_sequence and len(generated_sequence) == len(sequence) and all(c in 'ACDEFGHIKLMNPQRSTVWYX' for c in generated_sequence.upper()):
-                    # CRITICAL FIX: Use RAW DPLM output (complete sequence) for reward calculation
-                    # Store the complete generated sequence, track which positions were modified
-                    print(f"      ✅ Expert {expert_id} generated complete sequence (modified {len(masked_positions)} positions)")
-                    print(f"      🔍 Raw DPLM output (first 50): {generated_sequence[:50]}...")
-                    print(f"      🔍 Original sequence (first 50): {sequence[:50]}...")
-                    print(f"      🔍 Modified positions: {sorted(list(masked_positions))[:10]}...")
-                    
-                    # Return the COMPLETE sequence from DPLM (not partial with X's)
-                    return {'sequence': generated_sequence}
-                
-                print(f"      ⚠️ Expert {expert_id} generated invalid sequence")
-                return None
-        except Exception as e:
-            print(f"      ⚠️ Expert {expert_id} generation failed: {e}")
-            return None
-    
-    def _generate_proteinmpnn_candidate(self, sequence: str, masked_positions: Set[int]) -> str:
-        """Generate candidate using ProteinMPNN (same approach as working one-shot analysis)."""
-        try:
-            # Create masked sequence for ProteinMPNN
-            masked_sequence = list(sequence)
-            for pos in masked_positions:
-                masked_sequence[pos] = 'X'
-            masked_seq_str = ''.join(masked_sequence)
-            
-            # Use EXACT same approach as working one_shot_inverse_folding_analysis.py
-            # Load ProteinMPNN expert directly
-            proteinmpnn_expert = self.dplm2_integration._load_expert(3)  # ProteinMPNN is expert 3
-            
-            # Use direct ProteinMPNN generation method (same as working script)
-            generated_sequence = self.dplm2_integration._generate_with_proteinmpnn(
-                proteinmpnn_model=proteinmpnn_expert,
-                aa_sequence=masked_seq_str,
-                struct_tokens="",  # Not used for ProteinMPNN
-                task_type="inverse_folding",
-                temperature=1.0
+        if backend == "esmfold":
+            print(f"Initializing ESMFold (mock={self.use_mock})...")
+            self.structure_predictor = ESMFoldIntegration(
+                device=self.device,
+                use_mock=self.use_mock,
             )
-            
-            if generated_sequence and len(generated_sequence) == len(sequence):
-                # CRITICAL FIX: Use RAW ProteinMPNN output (complete sequence) for reward calculation
-                print(f"      ✅ ProteinMPNN generated complete sequence (modified {len(masked_positions)} positions)")
-                print(f"      🔍 Raw ProteinMPNN output (first 50): {generated_sequence[:50]}...")
-                print(f"      🔍 Original sequence (first 50): {sequence[:50]}...")
-                
-                # Return the COMPLETE sequence from ProteinMPNN (not partial with X's)
-                return generated_sequence
-            
-            return None
-            
-        except Exception as e:
-            print(f"      ⚠️ ProteinMPNN generation failed: {e}")
-            return None
-    
-    def _structure_tokens_to_coords(self, structure_tokens: Union[str, List[int], List[str]], seq_length: int) -> Optional[np.ndarray]:
-        """Convert structure tokens back to coordinates for evaluation"""
-        if structure_tokens is None:
-            return None
-        # Prefer official converter if available
-        if self.structure_converter is not None:
-            coords = self.structure_converter.tokens_to_coordinates(structure_tokens, seq_length)
-            if coords is not None:
-                return coords
-        try:
-            # Import structure tokenizer
-            from byprot.models.utils import get_struct_tokenizer
-            import torch
-            
-            struct_tokenizer = get_struct_tokenizer()
-            
-            # Parse structure tokens (space-separated numbers and mask tokens)
-            if isinstance(structure_tokens, str) and ',' in structure_tokens:
-                token_list = [t.strip() for t in structure_tokens.split(',') if t.strip()]
-            else:
-                token_list = structure_tokens.strip().split() if isinstance(structure_tokens, str) else list(structure_tokens)
-            if not token_list:
-                return None
-            
-            # Convert to tensor with overflow protection and mask token handling
-            valid_tokens = []
-            max_token_value = 8228  # DPLM-2 vocab size limit
-            mask_token_id = 8228  # Use max_id for mask tokens (gets clamped)
-            
-            print(f"      🔍 DEBUG: Processing {len(token_list)} structure tokens")
-            print(f"      🔍 DEBUG: Sample tokens: {token_list[:20]}")
-            
-            for i, t in enumerate(token_list):
-                token_str = str(t)
-                if token_str.isdigit():
-                    token_val = int(token_str)
-                    # Clamp tokens to valid range to prevent overflow
-                    if token_val > max_token_value:
-                        print(f"      🔍 DEBUG: Clamping token {token_val} to {max_token_value}")
-                        token_val = max_token_value
-                    valid_tokens.append(token_val)
-                elif token_str == '<mask_struct>':
-                    valid_tokens.append(mask_token_id)
-                    print(f"      🔍 DEBUG: Converting <mask_struct> at position {i} to token {mask_token_id}")
-                else:
-                    print(f"      🔍 DEBUG: Skipping special token: {token_str}")
-            
-            if len(valid_tokens) == 0:
-                return None
-            
-            tokens = torch.tensor(valid_tokens, dtype=torch.long)
-            
-            # Detokenize to coordinates
-            print(f"      🔍 DEBUG: Attempting to detokenize {len(valid_tokens)} structure tokens")
-            print(f"      🔍 DEBUG: First 10 tokens: {valid_tokens[:10]}")
-            coords = struct_tokenizer.detokenize(tokens.unsqueeze(0))  # Add batch dim
-            print(f"      🔍 DEBUG: Detokenization result: {type(coords)}")
-            
-            if coords is not None and 'atom37_positions' in coords:
-                # Extract CA coordinates (atom index 1)
-                full_coords = coords['atom37_positions'][0]  # Remove batch dim
-                ca_coords = full_coords[:, 1, :].cpu().numpy()  # CA atoms
-                return ca_coords
-            else:
-                # Fallback: return baseline coordinates if detokenization fails
-                baseline_coords = self.baseline_structure.get('coordinates')
-                if baseline_coords is not None:
-                    print(f"      🔄 Using baseline coordinates as fallback")
-                    return baseline_coords
-        except Exception as e:
-            print(f"      ⚠️ Structure token conversion failed: {e}")
-            # Fallback: return baseline coordinates
-            baseline_coords = self.baseline_structure.get('coordinates')
-            if baseline_coords is not None:
-                print(f"      🔄 Using baseline coordinates as fallback")
-                return baseline_coords
-        return None
-
-    def _estimate_plddt_from_coords(self, coords: np.ndarray) -> List[float]:
-        """Estimate per-residue confidence from coordinates using target reference distance."""
-        try:
-            if coords is None:
-                raise ValueError("No coordinates provided for pLDDT estimation")
-            reference = self.reference_coords
-            if reference is None:
-                reference = self.baseline_structure.get('coordinates')
-            if reference is None:
-                return [70.0] * len(coords)
-            coords = np.asarray(coords)
-            reference = np.asarray(reference)
-            min_len = min(len(coords), len(reference))
-            if min_len == 0:
-                return [70.0] * len(coords)
-            diffs = np.linalg.norm(coords[:min_len] - reference[:min_len], axis=1)
-            # Map distances to confidence [0,100]
-            confidences = (np.exp(-diffs / 4.0) * 100.0).tolist()
-            if len(coords) > min_len:
-                tail_value = confidences[-1] if confidences else 70.0
-                confidences.extend([tail_value] * (len(coords) - min_len))
-            return confidences
-        except Exception as e:
-            print(f"      ⚠️ Failed to estimate pLDDT from coords: {e}")
-            # Fallback: use sequence length from baseline structure
-            seq_len = len(self.baseline_structure.get('sequence', ''))
-            if seq_len == 0:
-                seq_len = 100  # Ultimate fallback
-            return [70.0] * seq_len
-    
-    def _evaluate_structure_reward(self, coords: np.ndarray, sequence: str) -> float:
-        """Evaluate structure reward based on coordinates vs reference."""
-        try:
-            self._last_structure_eval = None
-            reference_coords = self.reference_coords
-            if reference_coords is None:
-                reference_coords = self.baseline_structure.get('target_coordinates')
-            if reference_coords is None:
-                reference_coords = self.baseline_structure.get('coordinates')
-            if reference_coords is None or coords is None:
-                return 0.0
-            
-            sequence_for_reward = sequence
-            if not sequence_for_reward:
-                sequence_for_reward = self.reference_sequence
-            if not sequence_for_reward:
-                sequence_for_reward = self.baseline_structure.get('sequence')
-            if not sequence_for_reward:
-                sequence_for_reward = ""
-            
-            rmsd, tm_score, reward = evaluate_folding_metrics(
-                coords,
-                reference_coords,
-                sequence_for_reward,
+        elif backend in ("boltz", "chai1", "af3"):
+            print(f"Initializing ABCFold/{backend} (mock={self.use_mock})...")
+            self.structure_predictor = ABCFoldIntegration(
+                use_mock=self.use_mock,
+                engine=backend if backend != "af3" else "af3",
+                allow_fallback=True,
             )
-            print(
-                "      📊 Folding metrics: "
-                f"RMSD={rmsd:.3f}Å, TM={tm_score:.3f}, Reward={reward:.3f}"
+        elif backend == "abcfold":
+            print(f"Initializing ABCFold/{self.abcfold_engine} (mock={self.use_mock})...")
+            self.structure_predictor = ABCFoldIntegration(
+                use_mock=self.use_mock,
+                engine=self.abcfold_engine,
+                allow_fallback=True,
             )
-            self._last_structure_eval = {
-                'rmsd': float(rmsd),
-                'tm_score': float(tm_score),
-                'reward': float(reward),
-            }
-            return reward
-        except Exception as e:
-            print(f"      ⚠️ Structure reward calculation failed: {e}")
-            self._last_structure_eval = None
+        else:
+            raise ValueError(f"Unknown structure backend: {backend}")
+    
+    def generate_initial_sequence(self, length: int) -> str:
+        """Generate initial sequence based on init_mode."""
+        if self.init_mode == "all_x":
+            return 'X' * length
+        elif self.init_mode == "all_a":
+            return 'A' * length
+        elif self.init_mode == "all_g":
+            return 'G' * length
+        else:  # random
+            amino_acids = "ACDEFGHIKLMNPQRSTVWY"
+            return ''.join(random.choice(amino_acids) for _ in range(length))
+    
+    def compute_sequence_similarity(self, seq1: str, seq2: str) -> float:
+        """Compute sequence identity between two sequences."""
+        if len(seq1) != len(seq2):
             return 0.0
-
-    def _compute_structure_reward(self, rmsd: float, tm_score: float) -> float:
-        """Compatibility helper: compute folding reward from RMSD/TM metrics."""
-        try:
-            sequence = (
-                self.reference_sequence
-                or self.baseline_structure.get('sequence')
-                or ""
-            )
-            # Call with correct parameter order: (tm_score, rmsd, plddt, sequence, aar)
-            return calculate_folding_reward(
-                tm_score=tm_score, 
-                rmsd=rmsd, 
-                plddt=None,  # pLDDT not available here
-                sequence=sequence,
-                aar=1.0  # For folding, AAR is always 1.0 (sequence is fixed)
-            )
-        except Exception as e:
-            print(f"      ⚠️ Structure reward helper failed: {e}")
-            import traceback
-            traceback.print_exc()
+        matches = sum(1 for a, b in zip(seq1, seq2) if a == b)
+        return matches / len(seq1)
+    
+    def compute_sibling_convergence(self, sequences: List[str]) -> float:
+        """Compute average pairwise similarity among sibling sequences."""
+        if len(sequences) < 2:
             return 0.0
+        
+        total_sim = 0.0
+        num_pairs = 0
+        for i in range(len(sequences)):
+            for j in range(i + 1, len(sequences)):
+                total_sim += self.compute_sequence_similarity(sequences[i], sequences[j])
+                num_pairs += 1
+        
+        return total_sim / num_pairs if num_pairs > 0 else 0.0
     
-    def _compute_expert_entropy(self, sequence: str, expert: str, masked_positions: Set[int]) -> float:
-        """Compute predictive entropy using correct logit extraction methods."""
-        try:
-            # Create masked sequence for entropy calculation
-            masked_sequence = list(sequence)
-            for pos in masked_positions:
-                masked_sequence[pos] = 'X'
-            masked_seq_str = ''.join(masked_sequence)
-            
-            if expert == "ProteinMPNN" or "ProteinMPNN" in str(expert):
-                # Use ProteinMPNN entropy calculation with coordinates
-                coordinates = self.baseline_structure.get('coordinates')
-                if coordinates is not None:
-                    # Try to load ProteinMPNN expert and compute entropy
-                    try:
-                        proteinmpnn_expert = self.dplm2_integration._load_expert_on_demand("proteinmpnn")
-                        if proteinmpnn_expert and hasattr(proteinmpnn_expert, 'compute_entropy'):
-                            entropy = proteinmpnn_expert.compute_entropy(
-                                masked_sequence=masked_seq_str,
-                                structure_coords=coordinates
-                            )
-                            print(f"      📊 {expert} entropy: {entropy:.3f}")
-                            return entropy
-                    except:
-                        pass
-                    
-                    # Fallback: use DPLM2 ProteinMPNN entropy calculation
-                    try:
-                        entropy = self.dplm2_integration.compute_proteinmpnn_entropy(
-                            sequence, list(masked_positions)
-                        )
-                        print(f"      📊 {expert} entropy (fallback): {entropy:.3f}")
-                        return entropy
-                    except:
-                        pass
-                else:
-                    print(f"      ⚠️ No coordinates available for ProteinMPNN entropy")
-                    return 1.5  # Default entropy for ProteinMPNN
-            else:
-                # For DPLM-2 experts, use predictive entropy with correct expert ID
-                try:
-                    # Extract expert ID from expert name (e.g., "dplm2_0" -> 0, "dplm2_1" -> 1)
-                    if "dplm2_" in expert:
-                        expert_id = int(expert.split("_")[-1])
-                    else:
-                        expert_id = 0  # Default fallback
-                    
-                    entropy = self.dplm2_integration.compute_predictive_entropy(
-                        structure=self.baseline_structure,
-                        masked_sequence=masked_seq_str,
-                        expert_id=expert_id  # Use the ACTUAL expert ID
-                    )
-                    print(f"      📊 {expert} entropy (expert {expert_id}): {entropy:.3f}")
-                    return entropy
-                except Exception as e:
-                    print(f"      ⚠️ DPLM-2 entropy calculation failed for {expert}: {e}")
-                    pass
-            
-            # Final fallback: return moderate entropy based on number of masked positions
-            entropy = min(2.0, 0.1 * len(masked_positions) + 0.5)
-            print(f"      📊 {expert} entropy (default): {entropy:.3f}")
-            return entropy
-            
-        except Exception as e:
-            print(f"      ⚠️ Entropy calculation failed for {expert}: {e}")
-            return 0.5  # Default entropy
-    
-    def _compute_novelty(self, sequence: str, parent_node: MCTSNode) -> float:
+    def compute_novelty(self, sequence: str, parent_node: HallucinationNode) -> float:
         """Compute novelty based on Hamming distance to siblings."""
         if not parent_node.children:
             return 1.0
@@ -1364,116 +341,510 @@ class GeneralMCTS:
         
         return total_distance / count if count > 0 else 1.0
     
-    def _evaluate_sequence_aar(self, sequence: str) -> float:
-        """Evaluate sequence using compound reward: R = 0.6×AAR + 0.35×scTM + 0.05×B"""
-        if not self.reference_sequence or len(sequence) != len(self.reference_sequence):
-            return 0.5
+    def compute_entropy(self, sequence: str, coordinates: np.ndarray) -> float:
+        """
+        Compute sequence entropy based on amino acid distribution.
         
-        # DEBUG: Show what sequence is being evaluated
-        print(f"   🔍 REWARD EVAL: Sequence (first 50): {sequence[:50]}...")
-        print(f"   🔍 REWARD EVAL: Reference (first 50): {self.reference_sequence[:50]}...")
-        print(f"   🔍 REWARD EVAL: Contains X's: {'X' in sequence}")
-        
-        # Calculate AAR (Amino Acid Recovery)
-        matches = sum(1 for a, b in zip(sequence, self.reference_sequence) if a == b)
-        aar = matches / len(sequence)
-        
-        # Calculate scTM (structural similarity) using ESMFold
-        try:
-            # Use ESMFold to compute structural similarity
-            from utils.real_plddt_computation import compute_sctm_from_esmfold
-            sctm = compute_sctm_from_esmfold(
-                sequence, 
-                self.reference_sequence,
-                self.baseline_structure.get('coordinates')
-            )
-        except:
-            try:
-                # Fallback: Use DPLM2 integration scTM if available
-                sctm = self.dplm2_integration.compute_sctm(
-                    sequence, 
-                    self.baseline_structure,
-                    reference_sequence=self.reference_sequence
-                )
-            except:
-                # Final fallback: Use a different calculation than AAR
-                # Use structural diversity as proxy (different from AAR)
-                import numpy as np
-                # Simple structural proxy based on sequence properties
-                hydrophobic = sum(1 for aa in sequence if aa in 'AILMFPWV') / len(sequence)
-                charged = sum(1 for aa in sequence if aa in 'DEKR') / len(sequence)
-                polar = sum(1 for aa in sequence if aa in 'NQSTY') / len(sequence)
-                
-                # Structural compatibility score (different from AAR)
-                sctm = (hydrophobic * 0.4 + charged * 0.3 + polar * 0.3) * 0.8 + aar * 0.2
-                print(f"         Using structural proxy: hydrophobic={hydrophobic:.3f}, charged={charged:.3f}, polar={polar:.3f}")
-        
-        # Calculate biophysical score (B) - amino acid composition
-        try:
-            # Simple biophysical score based on amino acid diversity and composition
-            aa_counts = {}
-            for aa in sequence:
+        This is a simplified entropy calculation that doesn't require dplm2_integration.
+        For more sophisticated entropy, use the hallucination_expert's internal methods.
+        """
+        # Shannon entropy of amino acid distribution
+        aa_counts = {}
+        for aa in sequence:
+            if aa != 'X':
                 aa_counts[aa] = aa_counts.get(aa, 0) + 1
-            
-            # Diversity score (Shannon entropy of amino acid distribution)
-            total = len(sequence)
-            diversity = 0.0
-            for count in aa_counts.values():
-                if count > 0:
-                    p = count / total
-                    diversity -= p * math.log2(p)
-            
-            # Normalize diversity (max entropy for 20 amino acids = log2(20) ≈ 4.32)
-            biophysical = min(1.0, diversity / 4.32)
-        except:
-            # Fallback biophysical score
-            biophysical = 0.8
         
-        # Compound reward: R = 0.6×AAR + 0.35×scTM + 0.05×B
-        compound_reward = 0.6 * aar + 0.35 * sctm + 0.05 * biophysical
+        total = sum(aa_counts.values())
+        if total == 0:
+            return 0.0
         
-        print(f"      📊 Reward breakdown: AAR={aar:.3f}, scTM={sctm:.3f}, B={biophysical:.3f} → R={compound_reward:.3f}")
+        entropy = 0.0
+        for count in aa_counts.values():
+            if count > 0:
+                p = count / total
+                entropy -= p * math.log2(p)
         
-        return compound_reward
+        # Normalize by max entropy (log2(20) for 20 amino acids)
+        max_entropy = math.log2(20)
+        return entropy / max_entropy if max_entropy > 0 else 0.0
     
-    def _backpropagate_max_rule(self, node: MCTSNode):
-        """Backpropagate using max rule (W ← max(W, v))."""
+    def compute_convergence_reward(
+        self, 
+        sibling_convergence: float, 
+        parent_child_similarity: float,
+        plddt: float,
+        entropy: float = 0.0,
+    ) -> float:
+        """
+        Compute reward based on convergence metrics and structure quality.
+        
+        R = 0.4 * parent_child_similarity + 0.3 * sibling_convergence + 0.3 * normalized_plddt
+        """
+        normalized_plddt = plddt / 100.0
+        reward = 0.4 * parent_child_similarity + 0.3 * sibling_convergence + 0.3 * normalized_plddt
+        return reward
+    
+    def save_pdb(self, sequence: str, coordinates: np.ndarray, iteration: int, 
+                 depth: int, node_id: int, plddt: float, suffix: str = "") -> str:
+        """Save structure as PDB file."""
+        self.pdb_counter += 1
+        filename = f"iter{iteration:03d}_depth{depth:02d}_node{node_id:04d}_plddt{plddt:.1f}{suffix}.pdb"
+        filepath = self.output_dir / filename
+        
+        aa3_map = {
+            'A': 'ALA', 'C': 'CYS', 'D': 'ASP', 'E': 'GLU', 'F': 'PHE',
+            'G': 'GLY', 'H': 'HIS', 'I': 'ILE', 'K': 'LYS', 'L': 'LEU',
+            'M': 'MET', 'N': 'ASN', 'P': 'PRO', 'Q': 'GLN', 'R': 'ARG',
+            'S': 'SER', 'T': 'THR', 'V': 'VAL', 'W': 'TRP', 'Y': 'TYR',
+            'X': 'UNK'
+        }
+        
+        with open(filepath, 'w') as f:
+            f.write(f"REMARK   1 Hallucination MCTS Design\n")
+            f.write(f"REMARK   2 Iteration: {iteration}, Depth: {depth}, Node: {node_id}\n")
+            f.write(f"REMARK   3 Sequence: {sequence}\n")
+            f.write(f"REMARK   4 Mean pLDDT: {plddt:.2f}\n")
+            
+            for i, (aa, coord) in enumerate(zip(sequence, coordinates)):
+                aa3 = aa3_map.get(aa, 'ALA')
+                f.write(f"ATOM  {i+1:5d}  CA  {aa3} A{i+1:4d}    "
+                        f"{coord[0]:8.3f}{coord[1]:8.3f}{coord[2]:8.3f}  1.00{plddt:6.2f}           C\n")
+            
+            f.write("END\n")
+        
+        return str(filepath)
+    
+    def _save_pdb_for_dssp(self, sequence: str, coordinates: np.ndarray, 
+                           plddt_scores: np.ndarray, filepath: str):
+        """Save PDB with backbone atoms for DSSP analysis."""
+        aa3_map = {
+            'A': 'ALA', 'C': 'CYS', 'D': 'ASP', 'E': 'GLU', 'F': 'PHE',
+            'G': 'GLY', 'H': 'HIS', 'I': 'ILE', 'K': 'LYS', 'L': 'LEU',
+            'M': 'MET', 'N': 'ASN', 'P': 'PRO', 'Q': 'GLN', 'R': 'ARG',
+            'S': 'SER', 'T': 'THR', 'V': 'VAL', 'W': 'TRP', 'Y': 'TYR',
+            'X': 'UNK'
+        }
+        
+        with open(filepath, 'w') as f:
+            f.write(f"REMARK   1 Structure for DSSP analysis\n")
+            atom_num = 1
+            
+            for i, (aa, ca_coord) in enumerate(zip(sequence, coordinates)):
+                aa3 = aa3_map.get(aa, 'ALA')
+                plddt = float(plddt_scores[i]) if i < len(plddt_scores) else 50.0
+                res_num = i + 1
+                
+                # Generate approximate backbone atoms from CA position
+                n_coord = ca_coord + np.array([-1.46, 0.0, 0.0])
+                c_coord = ca_coord + np.array([1.52, 0.0, 0.0])
+                o_coord = c_coord + np.array([0.0, 1.23, 0.0])
+                
+                for atom_name, coord in [("N", n_coord), ("CA", ca_coord), ("C", c_coord), ("O", o_coord)]:
+                    elem = atom_name[0]
+                    f.write(f"ATOM  {atom_num:5d}  {atom_name:<3s} {aa3} A{res_num:4d}    "
+                            f"{coord[0]:8.3f}{coord[1]:8.3f}{coord[2]:8.3f}"
+                            f"  1.00{plddt:6.2f}           {elem}\n")
+                    atom_num += 1
+            
+            f.write("END\n")
+    
+    def expand_node(self, node: HallucinationNode, iteration: int = 0) -> List[HallucinationNode]:
+        """
+        Expand a node by running Structure -> ProteinMPNN cycle.
+        
+        Returns list of child nodes.
+        """
+        edit_log = []
+        dssp_result = None
+        
+        # Step 1: Predict structure from current sequence
+        backend_name = self.structure_backend.upper()
+        print(f"      {backend_name} predicting structure from: {node.sequence[:30]}...")
+        
+        # Get template/ligand conditioning for SS guidance Variants 3 & 4
+        template_cond = None
+        ligand_cond = None
+        if self.ss_guidance:
+            template_cond = self.ss_guidance.get_template_conditioning(iteration)
+            ligand_cond = self.ss_guidance.get_ligand_conditioning(iteration)
+        
+        # Call structure predictor
+        if template_cond or ligand_cond:
+            if hasattr(self.structure_predictor, 'predict_structure_with_conditioning'):
+                structure_result = self.structure_predictor.predict_structure_with_conditioning(
+                    node.sequence, template=template_cond, ligand=ligand_cond)
+            else:
+                print(f"      Warning: Backend does not support conditioning")
+                structure_result = self.structure_predictor.predict_structure(node.sequence)
+        else:
+            structure_result = self.structure_predictor.predict_structure(node.sequence)
+        
+        coords = structure_result['coordinates']
+        parent_plddt = structure_result['confidence']
+        parent_mean_plddt = float(np.mean(parent_plddt))
+        print(f"      Done - mean pLDDT={parent_mean_plddt:.1f}")
+        
+        # Step 1.5: Run DSSP for SS analysis if enabled
+        if self.ss_guidance and self.run_dir:
+            temp_pdb_path = self.run_dir / f"iter_{iteration:03d}" / "structure_pred.pdb"
+            temp_pdb_path.parent.mkdir(parents=True, exist_ok=True)
+            self._save_pdb_for_dssp(node.sequence, coords, parent_plddt, str(temp_pdb_path))
+            
+            dssp_result = self.ss_guidance.run_dssp(str(temp_pdb_path), len(node.sequence))
+            if dssp_result:
+                print(f"      DSSP: {len(dssp_result.helix_positions)} helix, {len(dssp_result.beta_positions)} beta")
+        
+        # Step 2: Generate K candidate sequences
+        candidate_sequences = []
+        candidate_data = []
+        
+        total_candidates = self.num_candidates * self.num_rollouts
+        print(f"      Generating {total_candidates} candidates...")
+        
+        for rollout in range(self.num_rollouts):
+            try:
+                for k in range(self.num_candidates):
+                    masked_seq = node.sequence
+                    
+                    # Variant 1: Apply beta-lock before MPNN
+                    if (self.ss_guidance and dssp_result and 
+                        self.ss_guidance_config.ss_guidance == "beta_lock_reinit_helix"):
+                        masked_seq, variant1_edits = self.ss_guidance.apply_variant1_beta_lock_reinit_helix(
+                            node.sequence, dssp_result)
+                        edit_log.extend(variant1_edits)
+                    
+                    # Generate new sequence via ProteinMPNN
+                    new_sequence = self.hallucination_expert.proteinmpnn.design_sequence(
+                        coordinates=coords, masked_sequence=masked_seq)
+                    
+                    # Variant 2: Apply PG injection after MPNN
+                    candidate_edit_log = []
+                    if (self.ss_guidance and dssp_result and 
+                        self.ss_guidance_config.ss_guidance == "x_init_helix_pg"):
+                        new_sequence, variant2_edits = self.ss_guidance.apply_variant2_helix_pg_injection(
+                            new_sequence, dssp_result)
+                        candidate_edit_log.extend(variant2_edits)
+                    
+                    # Evaluate new sequence
+                    new_structure_result = self.structure_predictor.predict_structure(new_sequence)
+                    new_coords = new_structure_result['coordinates']
+                    new_plddt = new_structure_result['confidence']
+                    new_mean_plddt = float(np.mean(new_plddt))
+                    
+                    # Compute entropy
+                    entropy = self.compute_entropy(new_sequence, new_coords)
+                    
+                    candidate_sequences.append(new_sequence)
+                    candidate_data.append({
+                        'sequence': new_sequence,
+                        'coordinates': new_coords,
+                        'plddt': new_plddt,
+                        'mean_plddt': new_mean_plddt,
+                        'entropy': entropy,
+                        'edit_log': candidate_edit_log,
+                    })
+                    
+                    print(f"      Candidate {len(candidate_sequences)}: pLDDT={new_mean_plddt:.1f}")
+                    
+            except Exception as e:
+                print(f"      Rollout {rollout+1} failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Step 3: Compute sibling convergence
+        sibling_convergence = self.compute_sibling_convergence(candidate_sequences)
+        print(f"      Sibling convergence: {sibling_convergence:.3f}")
+        
+        # Step 4: Create child nodes
+        children = []
+        for i, cand in enumerate(candidate_data):
+            parent_child_sim = self.compute_sequence_similarity(node.sequence, cand['sequence'])
+            novelty = self.compute_novelty(cand['sequence'], node)
+            
+            reward = self.compute_convergence_reward(
+                sibling_convergence, parent_child_sim, cand['mean_plddt'], cand['entropy'])
+            
+            child = HallucinationNode(
+                sequence=cand['sequence'],
+                coordinates=cand['coordinates'],
+                plddt_scores=cand['plddt'],
+                mean_plddt=cand['mean_plddt'],
+                parent=node,
+                depth=node.depth + 1,
+                convergence_score=parent_child_sim,
+                parent_child_similarity=parent_child_sim,
+                sibling_convergence=sibling_convergence,
+                entropy=cand['entropy'],
+                novelty=novelty,
+                visits=1,
+                total_reward=reward,
+            )
+            children.append(child)
+            
+            print(f"      Child {i+1}: sim={parent_child_sim:.3f}, pLDDT={cand['mean_plddt']:.1f}, reward={reward:.3f}")
+        
+        return children
+    
+    def select_node(self, root: HallucinationNode) -> HallucinationNode:
+        """UCT/PH-UCT selection - traverse tree to find best node to expand."""
+        node = root
+        while node.children and node.depth < self.max_depth:
+            if self.use_ph_uct:
+                node = max(node.children, key=lambda c: c.ph_uct_score(
+                    self.exploration_constant, self.entropy_weight, self.novelty_weight))
+            else:
+                node = max(node.children, key=lambda c: c.uct_score(self.exploration_constant))
+        return node
+    
+    def backpropagate(self, node: HallucinationNode, reward: float):
+        """Backpropagate reward up the tree (sum rule)."""
+        current = node
+        while current is not None:
+            current.visits += 1
+            current.total_reward += reward
+            current = current.parent
+    
+    def _backpropagate_max_rule(self, node: HallucinationNode):
+        """Backpropagate using max rule (W <- max(W, v)) - aligned with sequence_level_mcts.py."""
         current = node
         while current:
             current.visits += 1
             current.total_reward = max(current.total_reward, node.reward)
             current = current.parent
     
-    def _find_best_node_in_tree(self, root: MCTSNode) -> MCTSNode:
-        """Find the best node in the entire tree."""
+    def get_best_child(self, node: HallucinationNode) -> HallucinationNode:
+        """Get the best child node based on reward - aligned with sequence_level_mcts.py."""
+        if not node.children:
+            return node
+        
+        best_child = node
+        best_reward = node.reward
+        
+        for child in node.children:
+            child_reward = child.reward
+            if child_reward > best_reward:
+                best_child = child
+                best_reward = child_reward
+        
+        return best_child
+    
+    def _prepare_plddt_scores(self, sequence_length: int, raw_scores) -> List[float]:
+        """Normalize raw pLDDT inputs - aligned with sequence_level_mcts.py."""
+        try:
+            if raw_scores is None:
+                raise ValueError("No pLDDT scores provided")
+            
+            # Handle dict-style payloads
+            if isinstance(raw_scores, dict):
+                candidates = ['plddt_scores', 'plddt', 'scores', 'confidence', 'lddts']
+                selected = None
+                for key in candidates:
+                    if key in raw_scores and raw_scores[key]:
+                        selected = raw_scores[key]
+                        break
+                if selected is None and raw_scores:
+                    for value in raw_scores.values():
+                        if value:
+                            selected = value
+                            break
+                raw_scores = selected if selected is not None else []
+            
+            # Convert numpy arrays / tensors to list
+            if hasattr(raw_scores, 'cpu'):
+                raw_scores = raw_scores.cpu()
+            if hasattr(raw_scores, 'numpy'):
+                raw_scores = raw_scores.numpy()
+            if isinstance(raw_scores, np.ndarray):
+                raw_scores = raw_scores.tolist()
+            
+            if not isinstance(raw_scores, (list, tuple)):
+                raw_scores = [float(raw_scores)]
+            
+            scores = [float(x) for x in raw_scores if x is not None]
+        except Exception as e:
+            print(f"   Warning: Failed to parse pLDDT scores ({e}); using default 70.0.")
+            scores = []
+        
+        if not scores:
+            scores = [70.0] * sequence_length
+        else:
+            max_score = max(scores)
+            if max_score <= 1.5:
+                scores = [min(1.0, max(0.0, s)) * 100.0 for s in scores]
+            if len(scores) >= sequence_length:
+                scores = scores[:sequence_length]
+            else:
+                pad_value = float(np.mean(scores)) if scores else 70.0
+                scores = scores + [pad_value] * (sequence_length - len(scores))
+        
+        return scores
+    
+    def _compute_progressive_plddt_masking(self, sequence: str, plddt_scores: List[float], depth: int) -> Set[int]:
+        """Progressive pLDDT masking - aligned with sequence_level_mcts.py."""
+        if plddt_scores is None or len(plddt_scores) == 0:
+            plddt_scores = [70.0] * len(sequence)
+        elif len(plddt_scores) != len(sequence):
+            plddt_scores = self._prepare_plddt_scores(len(sequence), plddt_scores)
+        
+        # Progressive thresholds by depth
+        if depth == 0:
+            threshold = 70.0
+            target_ratio = 0.25
+        elif depth == 1:
+            threshold = 75.0
+            target_ratio = 0.20
+        elif depth == 2:
+            threshold = 80.0
+            target_ratio = 0.15
+        elif depth == 3:
+            threshold = 85.0
+            target_ratio = 0.05
+        else:
+            threshold = 100.0
+            target_ratio = 0.0
+        
+        # Threshold-based masking
+        threshold_masked = set([i for i, score in enumerate(plddt_scores) if score < threshold])
+        
+        min_positions = max(3, int(len(sequence) * 0.05))
+        max_positions = int(len(sequence) * 0.30)
+        
+        if min_positions <= len(threshold_masked) <= max_positions:
+            masked_positions = threshold_masked
+        else:
+            # Quantile-based fallback
+            num_to_mask = max(min_positions, int(len(sequence) * target_ratio))
+            num_to_mask = min(num_to_mask, max_positions)
+            
+            position_scores = [(i, score) for i, score in enumerate(plddt_scores)]
+            position_scores.sort(key=lambda x: x[1])
+            
+            masked_positions = set([pos for pos, _ in position_scores[:num_to_mask]])
+        
+        return masked_positions
+    
+    def _evaluate_sequence_aar(self, sequence: str, reference_sequence: str = None) -> float:
+        """Evaluate sequence using AAR - aligned with sequence_level_mcts.py."""
+        if reference_sequence is None or len(sequence) != len(reference_sequence):
+            return 0.5
+        
+        matches = sum(1 for a, b in zip(sequence, reference_sequence) if a == b)
+        aar = matches / len(sequence)
+        return aar
+    
+    def search(self) -> HallucinationNode:
+        """Run MCTS search for hallucination design."""
+        print("\n" + "="*80)
+        print("Starting Hallucination MCTS Search")
+        if self.ss_guidance_config.ss_guidance != "none":
+            print(f"   SS Guidance: {self.ss_guidance_config.ss_guidance}")
+        print("="*80)
+        
+        # Create root node
+        initial_seq = self.generate_initial_sequence(self.sequence_length)
+        print(f"\nRoot: {self.init_mode} sequence (length={len(initial_seq)})")
+        
+        root = HallucinationNode(sequence=initial_seq, depth=0, visits=1)
+        
+        node_counter = 0
+        summary_rows = []
         best_node = root
-        best_reward = root.reward
+        best_convergence = 0.0
+        
+        for iteration in range(self.num_iterations):
+            print(f"\nIteration {iteration + 1}/{self.num_iterations}")
+            
+            # Selection
+            selected = self.select_node(root)
+            print(f"   Selected node at depth {selected.depth}")
+            
+            # Expansion
+            iter_best_plddt = 0.0
+            iter_best_reward = 0.0
+            iter_num_valid = 0
+            
+            if selected.depth < self.max_depth:
+                children = self.expand_node(selected, iteration=iteration)
+                selected.children.extend(children)
+                
+                for child in children:
+                    node_counter += 1
+                    self.backpropagate(child, child.get_reward())
+                    iter_num_valid += 1
+                    iter_best_plddt = max(iter_best_plddt, child.mean_plddt)
+                    iter_best_reward = max(iter_best_reward, child.get_reward())
+                    
+                    # Save PDB
+                    if child.coordinates is not None:
+                        pdb_path = self.save_pdb(
+                            child.sequence, child.coordinates, iteration + 1,
+                            child.depth, node_counter, child.mean_plddt)
+                        print(f"   Saved: {Path(pdb_path).name}")
+                    
+                    # Track best
+                    if child.convergence_score > best_convergence:
+                        best_convergence = child.convergence_score
+                        best_node = child
+                        print(f"   New best: sim={best_convergence:.3f}, pLDDT={child.mean_plddt:.1f}")
+            
+            summary_rows.append({
+                "iteration": iteration + 1,
+                "mean_plddt": iter_best_plddt,
+                "best_reward": iter_best_reward,
+                "num_valid": iter_num_valid,
+                "best_convergence": best_convergence,
+                "best_depth": best_node.depth,
+            })
+            
+            if best_convergence > 0.95:
+                print(f"\nConverged! Parent-child similarity > 95%")
+                break
+        
+        # Save final best
+        if best_node.coordinates is not None:
+            final_pdb = self.save_pdb(
+                best_node.sequence, best_node.coordinates, self.num_iterations,
+                best_node.depth, 9999, best_node.mean_plddt, suffix="_BEST")
+            print(f"\nBest structure saved: {final_pdb}")
+        
+        # Save summary CSV
+        if self.run_dir:
+            self._save_summary_csv(summary_rows)
+        
+        return best_node
+    
+    def _save_summary_csv(self, summary_rows: List[Dict]):
+        """Save summary CSV with per-iteration metrics."""
+        csv_path = self.run_dir / "summary.csv"
+        
+        if not summary_rows:
+            return
+        
+        fieldnames = list(summary_rows[0].keys())
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        
+        print(f"   Summary saved: {csv_path}")
+    
+    def find_best_in_tree(self, root: HallucinationNode) -> HallucinationNode:
+        """Find the best node in the entire tree by convergence."""
+        best = root
+        best_score = root.convergence_score
         
         def traverse(node):
-            nonlocal best_node, best_reward
-            if node.reward > best_reward:
-                best_node = node
-                best_reward = node.reward
-            
+            nonlocal best, best_score
+            if node.convergence_score > best_score:
+                best = node
+                best_score = node.convergence_score
             for child in node.children:
                 traverse(child)
         
         traverse(root)
-        return best_node
-    
-    # Legacy compatibility methods
-    def _calculate_aar(self, sequence: str) -> float:
-        """Legacy method for AAR calculation."""
-        return self._evaluate_sequence_aar(sequence)
-    
-    def _evaluate_sequence(self, sequence: str) -> float:
-        """Legacy method for sequence evaluation."""
-        return self._evaluate_sequence_aar(sequence)
-    
-    def _backpropagate(self, node: MCTSNode, reward: float):
-        """Legacy backpropagation method."""
-        self._backpropagate_max_rule(node)
+        return best
 
 
-# Alias for backward compatibility
-SequenceLevelMCTS = GeneralMCTS
+# Backward compatibility alias
+GeneralMCTS = HallucinationMCTS
+MCTSNode = HallucinationNode
