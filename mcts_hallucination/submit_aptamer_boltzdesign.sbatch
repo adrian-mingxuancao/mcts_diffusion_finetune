@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -J aptamer_boltz
 #SBATCH -p general
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH -t 12:00:00
+#SBATCH --mem=128G
+#SBATCH -t 24:00:00
 #SBATCH --output=/net/scratch/%u/logs/%x_%A_%a.out
 #SBATCH --error=/net/scratch/%u/logs/%x_%A_%a.err
 #SBATCH --array=0-2
@@ -20,10 +20,11 @@ OUT_ROOT="${PROJECT_ROOT}/results/aptamer"
 
 # Aptamer search parameters (tune as needed)
 LENGTH="${LENGTH:-60}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
-ITERS="${ITERS:-10}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+ITERS="${ITERS:-5}"
 ELITE="${ELITE:-8}"
 SEED="${SEED:-0}"
+BOLTZ_TIMEOUT="${BOLTZ_TIMEOUT:-1800}"
 
 # Scoring weights
 W_CONF="${W_CONF:-1.0}"
@@ -86,12 +87,57 @@ echo "Python: $(which python)"
 python -V
 
 # -------------------------
-# Validate inputs
+# Download PDB if missing
 # -------------------------
-if [[ ! -f "${TARGET_PDB}" ]]; then
-  echo "ERROR: Missing target PDB: ${TARGET_PDB}"
-  echo "Please place it at data/targets/${TARGET_ID}.pdb"
-  exit 1
+mkdir -p "${TARGET_DIR}"
+if [[ ! -f "${TARGET_PDB}" ]] || [[ $(head -1 "${TARGET_PDB}" 2>/dev/null) == "<!doctype"* ]]; then
+  echo "Downloading PDB ${TARGET_ID} from RCSB..."
+  curl -sL "https://files.rcsb.org/download/${TARGET_ID}.pdb" -o "${TARGET_PDB}"
+  
+  # Check if we got HTML instead of PDB (some structures only have CIF)
+  if [[ ! -s "${TARGET_PDB}" ]] || [[ $(head -1 "${TARGET_PDB}") == "<!doctype"* ]]; then
+    echo "PDB format not available, trying CIF and converting..."
+    CIF_FILE="${TARGET_DIR}/${TARGET_ID}.cif"
+    curl -sL "https://files.rcsb.org/download/${TARGET_ID}.cif" -o "${CIF_FILE}"
+    
+    if [[ -s "${CIF_FILE}" ]] && [[ $(head -1 "${CIF_FILE}") == "data_"* ]]; then
+      # Convert CIF to PDB using BioPython
+      python3 << PYEOF
+from Bio.PDB import MMCIFParser, PDBIO
+parser = MMCIFParser(QUIET=True)
+structure = parser.get_structure("${TARGET_ID}", "${CIF_FILE}")
+# Rename long chain IDs to single letters for PDB format
+chain_map = {}
+next_chain = ord('A')
+for model in structure:
+    for chain in model:
+        old_id = chain.id
+        if old_id not in chain_map:
+            chain_map[old_id] = chr(next_chain)
+            next_chain += 1
+        chain.id = chain_map[old_id]
+io = PDBIO()
+io.set_structure(structure)
+io.save("${TARGET_PDB}")
+print(f"Converted CIF to PDB. Chain mapping: {chain_map}")
+PYEOF
+    fi
+  fi
+  
+  if [[ ! -s "${TARGET_PDB}" ]] || [[ $(head -1 "${TARGET_PDB}") == "<!doctype"* ]]; then
+    echo "ERROR: Failed to download/convert ${TARGET_ID}"
+    exit 1
+  fi
+  echo "Downloaded: ${TARGET_PDB}"
+else
+  echo "PDB already exists: ${TARGET_PDB}"
+fi
+
+# Log target-specific notes
+if [[ "${TARGET_ID}" == "4AD7" ]]; then
+  echo "NOTE: Glypican-1 (4AD7) has glycosylation sites noted but not fully resolved in crystal structure"
+elif [[ "${TARGET_ID}" == "6Y8K" ]]; then
+  echo "NOTE: CD137 (6Y8K) crystal is complexed with agonist BCY10916. Designing binding independent of BCY."
 fi
 
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
@@ -116,6 +162,7 @@ python -u "${PROJECT_ROOT}/aptamer_boltzdesign.py" \
   --w_conf "${W_CONF}" \
   --w_iface "${W_IFACE}" \
   --w_invalid "${W_INVALID}" \
+  --boltz_timeout "${BOLTZ_TIMEOUT}" \
   ${EXTRA_ARGS}
 set +x
 

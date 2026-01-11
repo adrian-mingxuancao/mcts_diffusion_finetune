@@ -142,6 +142,8 @@ def parse_args():
                         help="Use mock mode for testing (no real Boltz calls)")
     parser.add_argument("--recycling_steps", type=int, default=3,
                         help="Boltz recycling steps (default: 3)")
+    parser.add_argument("--boltz_timeout", type=int, default=1800,
+                        help="Timeout per Boltz prediction in seconds (default: 1800)")
     
     args = parser.parse_args()
     
@@ -357,6 +359,7 @@ def predict_complex_boltz(
     candidate_id: str,
     recycling_steps: int = 3,
     use_mock: bool = False,
+    timeout: int = 1800,
 ) -> Dict:
     """
     Predict protein-DNA complex structure using Boltz.
@@ -409,7 +412,7 @@ def predict_complex_boltz(
             "--recycling_steps", str(recycling_steps),
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
         
         if result.returncode != 0:
             return {
@@ -535,6 +538,7 @@ def evaluate_candidate(
     w_invalid: float,
     recycling_steps: int = 3,
     use_mock: bool = False,
+    boltz_timeout: int = 1800,
 ) -> CandidateResult:
     """
     Evaluate a single aptamer candidate.
@@ -556,7 +560,8 @@ def evaluate_candidate(
     # Predict complex structure
     pred_result = predict_complex_boltz(
         protein_pdb, dna_sequence, output_dir, candidate_id,
-        recycling_steps=recycling_steps, use_mock=use_mock
+        recycling_steps=recycling_steps, use_mock=use_mock,
+        timeout=boltz_timeout
     )
     
     if not pred_result['success']:
@@ -707,6 +712,7 @@ def run_design_loop(args) -> None:
                 str(target_pdb), seq, all_structures_dir, candidate_id,
                 w_conf=args.w_conf, w_iface=args.w_iface, w_invalid=args.w_invalid,
                 recycling_steps=args.recycling_steps, use_mock=args.use_mock,
+                boltz_timeout=args.boltz_timeout,
             )
             results.append(result)
             
