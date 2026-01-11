@@ -1,42 +1,81 @@
 # MCTS Hallucination Pipeline Requirements
 # Install with: pip install -r requirements.txt
 
-# Core dependencies
+s# ==============================================================================
+# Core Dependencies (Required)
+# ==============================================================================
 numpy>=1.24.0
 torch>=2.0.0
 transformers>=4.40.0
-
-# Structure prediction
 biopython>=1.80
 
-# ESMFold (optional - for ESMFold backend)
-# Requires: pip install torch transformers
+# ==============================================================================
+# Structure Prediction Backends
+# ==============================================================================
+
+# ESMFold (default backend - uses HuggingFace transformers)
 # Model: facebook/esmfold_v1
+# No additional install needed beyond transformers
 
-# Boltz (optional - for Boltz backend)
-# Install from: https://github.com/jwohlwend/boltz
-# boltz>=0.3.0
+# Boltz (optional - diffusion-based structure prediction)
+# Install: pip install boltz
+boltz>=0.3.0
 
-# Chai-1 (optional - for Chai backend)
-# Install from: https://github.com/chaidiscovery/chai-lab
-# chai-lab>=0.5.0
+# Chai-1 (optional - structure prediction with ligand support)
+# Install: pip install chai-lab
+chai-lab>=0.5.0
 
-# ProteinMPNN (required for inverse folding)
+# ==============================================================================
+# Inverse Folding
+# ==============================================================================
+
+# ProteinMPNN (required for protein inverse folding)
 # Clone from: https://github.com/dauparas/ProteinMPNN
-# Set PROTEINMPNN_PATH environment variable
+# Set environment variable: export PROTEINMPNN_PATH=/path/to/proteinmpnn
 
-# DSSP (required for secondary structure analysis)
+# NA-MPNN (optional - for nucleic acid design)
+# Clone from: https://github.com/dauparas/LigandMPNN
+# Included in extra/BoltzDesign1/LigandMPNN
+
+# ==============================================================================
+# Secondary Structure Analysis
+# ==============================================================================
+
+# DSSP (required for SS guidance)
 # Install with micromamba:
-#   micromamba create -p /net/scratch/$USER/dssp_env -c conda-forge dssp
+#   curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | \
+#       tar -xvj -C /net/scratch/$USER/bin --strip-components=1 bin/micromamba
+#   /net/scratch/$USER/bin/micromamba create -y \
+#       -p /net/scratch/$USER/dssp_env -c conda-forge dssp
 # Binary path: /net/scratch/$USER/dssp_env/bin/mkdssp
 
-# Visualization and analysis
+# ==============================================================================
+# Visualization and Analysis
+# ==============================================================================
 matplotlib>=3.5.0
 pandas>=1.5.0
 scipy>=1.10.0
 
+# ==============================================================================
 # Testing
+# ==============================================================================
 pytest>=7.0.0
 
-# Optional: ABCFold wrapper for AF3/Boltz/Chai
+# ==============================================================================
+# Optional: ABCFold wrapper for AF3/Boltz/Chai unified interface
+# ==============================================================================
 # cd ABCFold && pip install -e .
+
+# ==============================================================================
+# Optional: Additional design tools
+# ==============================================================================
+
+# BoltzDesign1 (binder design)
+# Located in: extra/BoltzDesign1/
+# cd extra/BoltzDesign1 && pip install -e .
+
+# PocketGen (pocket generation)
+# Located in: extra/PocketGen/
+
+# RNA-FrameFlow (RNA backbone design)
+# Located in: extra/rna-backbone-design/
