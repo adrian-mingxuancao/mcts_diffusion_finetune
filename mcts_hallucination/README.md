@@ -43,6 +43,13 @@ MCTS Tree Search:
 
 ABCFold is already cloned in this directory. To install:
 
+create virtual env
+```bash
+python3 -m venv ~/venvs/abcfold
+source ~/venvs/abcfold/bin/activate
+python -m pip install -U pip setuptools wheel
+```
+
 ```bash
 cd ABCFold
 pip install -e .
